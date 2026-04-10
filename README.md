@@ -76,4 +76,4 @@ By downloading, building, or running this software, you agree to these terms.
 
 ## License
 
-MIT
+GPL v3 — see [LICENSE](LICENSE).
