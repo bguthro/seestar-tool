@@ -17,6 +17,16 @@ anyhow = "1"
 md5 = "0.7"
 futures-util = "0.3"
 
+[lints.rust]
+dead_code = "deny"
+unused_imports = "deny"
+unused_mut = "deny"
+unused_parens = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+empty_line_after_doc_comments = "deny"
+
 [profile.release]
 opt-level = 3
 strip = true

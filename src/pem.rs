@@ -1,5 +1,5 @@
-/// PEM private-key extraction from libopenssllib.so inside an APK.
-/// Mirrors extract_pem.py.
+//! PEM private-key extraction from libopenssllib.so inside an APK.
+//! Mirrors extract_pem.py.
 
 use anyhow::Result;
 use regex::Regex;
@@ -36,10 +36,7 @@ fn extract_strings(data: &[u8]) -> String {
 
 /// Find all PEM private key blocks inside a string dump.
 fn find_pem_keys(strings_output: &str) -> Vec<String> {
-    let re = Regex::new(
-        r"-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----",
-    )
-    .unwrap();
+    let re = Regex::new(r"-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----").unwrap();
     re.find_iter(strings_output)
         .map(|m| m.as_str().to_string())
         .collect()
@@ -47,7 +44,6 @@ fn find_pem_keys(strings_output: &str) -> Vec<String> {
 
 /// Result of a PEM extraction run.
 pub struct PemResult {
-    pub version: String,
     pub keys: Vec<String>,
 }
 
@@ -67,10 +63,7 @@ pub fn extract_pem_from_apk(apk_path: &str, progress: impl Fn(String)) -> Result
         .collect();
 
     if found.is_empty() {
-        return Ok(PemResult {
-            version,
-            keys: vec![],
-        });
+        return Ok(PemResult { keys: vec![] });
     }
 
     let mut all_keys: HashSet<String> = HashSet::new();
@@ -90,27 +83,5 @@ pub fn extract_pem_from_apk(apk_path: &str, progress: impl Fn(String)) -> Result
 
     let mut keys: Vec<String> = all_keys.into_iter().collect();
     keys.sort();
-    Ok(PemResult { version, keys })
-}
-
-/// Write extracted PEM keys to files in `out_dir`.
-/// Returns the list of paths written.
-pub fn save_pem_keys(
-    keys: &[String],
-    version: &str,
-    out_dir: &Path,
-) -> Result<Vec<std::path::PathBuf>> {
-    std::fs::create_dir_all(out_dir)?;
-    let mut paths = Vec::new();
-    for (i, key) in keys.iter().enumerate() {
-        let filename = if keys.len() > 1 {
-            format!("seestar_apk_{}_{}.pem", version, i + 1)
-        } else {
-            format!("seestar_apk_{}.pem", version)
-        };
-        let path = out_dir.join(filename);
-        std::fs::write(&path, format!("{}\n", key))?;
-        paths.push(path);
-    }
-    Ok(paths)
+    Ok(PemResult { keys })
 }

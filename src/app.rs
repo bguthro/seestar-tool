@@ -1,7 +1,7 @@
-/// egui application — two tabs: Firmware Update and Extract PEM.
+//! egui application — two tabs: Firmware Update and Extract PEM.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use eframe::egui::{self, RichText};
 
@@ -43,9 +43,9 @@ enum Tab {
 #[derive(Default, PartialEq)]
 enum FirmwareSource {
     #[default]
-    LocalApk,   // user picks an APK/XAPK file
+    LocalApk, // user picks an APK/XAPK file
     LocalIscope, // user picks a raw iscope file
-    Download,   // fetch from APKPure
+    Download,    // fetch from APKPure
 }
 
 struct FirmwareTab {
@@ -146,25 +146,37 @@ impl FirmwareTab {
         self.log.push("Fetching version list…".to_string());
 
         self.rt.spawn(async move {
-            let log = |s: String| { let _ = tx.send(TaskMsg::Log(s)); };
+            let log = |s: String| {
+                let _ = tx.send(TaskMsg::Log(s));
+            };
             // Try full version list first; fall back to latest-only endpoint.
             let result = match crate::apkpure::fetch_versions(|s| log(s.clone())).await {
                 Ok(v) => Ok(v),
                 Err(_) => {
                     log("Version list failed, trying latest-only endpoint…".to_string());
-                    crate::apkpure::fetch_latest(|s| log(s.clone())).await.map(|v| vec![v])
+                    crate::apkpure::fetch_latest(|s| log(s.clone()))
+                        .await
+                        .map(|v| vec![v])
                 }
             };
             match result {
-                Ok(versions) => { let _ = tx.send(TaskMsg::VersionList(versions)); }
-                Err(e) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
+                Ok(versions) => {
+                    let _ = tx.send(TaskMsg::VersionList(versions));
+                }
+                Err(e) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
             }
         });
     }
 
     fn start_download(&mut self) {
-        let Some((version, download_url)) = self.resolved_version() else { return };
-        let dest_dir = std::env::current_dir().unwrap_or_default().join(format!("v{}", version));
+        let Some((version, download_url)) = self.resolved_version() else {
+            return;
+        };
+        let dest_dir = std::env::current_dir()
+            .unwrap_or_default()
+            .join(format!("v{}", version));
 
         let (tx, rx) = channel();
         self.tx = Some(tx.clone());
@@ -176,19 +188,28 @@ impl FirmwareTab {
 
         let tx2 = tx.clone();
         self.rt.spawn(async move {
-            let prog = { let tx = tx.clone(); move |d, t| { let _ = tx.send(TaskMsg::Progress(d, t)); } };
+            let prog = {
+                let tx = tx.clone();
+                move |d, t| {
+                    let _ = tx.send(TaskMsg::Progress(d, t));
+                }
+            };
             match crate::apkpure::download_version(&version, &download_url, &dest_dir, prog).await {
                 Ok(path) => {
                     let _ = tx2.send(TaskMsg::Downloaded(path));
                     let _ = tx2.send(TaskMsg::Done);
                 }
-                Err(e) => { let _ = tx2.send(TaskMsg::Error(e.to_string())); }
+                Err(e) => {
+                    let _ = tx2.send(TaskMsg::Error(e.to_string()));
+                }
             }
         });
     }
 
     fn start_download_and_install(&mut self) {
-        let Some((version, download_url)) = self.resolved_version() else { return };
+        let Some((version, download_url)) = self.resolved_version() else {
+            return;
+        };
         let host = self.seestar_host.clone();
 
         let dest_dir = std::env::current_dir()
@@ -208,36 +229,56 @@ impl FirmwareTab {
             // Download
             let prog = {
                 let tx = tx.clone();
-                move |d, t| { let _ = tx.send(TaskMsg::Progress(d, t)); }
+                move |d, t| {
+                    let _ = tx.send(TaskMsg::Progress(d, t));
+                }
             };
-            let path = match crate::apkpure::download_version(&version, &download_url, &dest_dir, prog).await {
-                Ok(p) => p,
-                Err(e) => { let _ = tx2.send(TaskMsg::Error(e.to_string())); return; }
-            };
+            let path =
+                match crate::apkpure::download_version(&version, &download_url, &dest_dir, prog)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx2.send(TaskMsg::Error(e.to_string()));
+                        return;
+                    }
+                };
             let _ = tx2.send(TaskMsg::Downloaded(path.clone()));
             let _ = tx2.send(TaskMsg::Progress(0, 0));
 
             // Extract + upload (blocking; run in spawn_blocking)
             let tx_log = tx2.clone();
-            let tx_up  = tx2.clone();
+            let tx_up = tx2.clone();
             let tx_ext = tx2.clone();
-            let host2  = host.clone();
-            let path2  = path.clone();
+            let host2 = host.clone();
+            let path2 = path.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let iscope = crate::firmware::extract_iscope(
                     path2.to_str().unwrap_or_default(),
-                    move |s| { let _ = tx_ext.send(TaskMsg::Log(s)); },
+                    move |s| {
+                        let _ = tx_ext.send(TaskMsg::Log(s));
+                    },
                 )?;
-                let log = move |s: String| { let _ = tx_log.send(TaskMsg::Log(s)); };
-                let up  = move |d, t| { let _ = tx_up.send(TaskMsg::Progress(d, t)); };
+                let log = move |s: String| {
+                    let _ = tx_log.send(TaskMsg::Log(s));
+                };
+                let up = move |d, t| {
+                    let _ = tx_up.send(TaskMsg::Progress(d, t));
+                };
                 crate::firmware::upload_firmware(&host2, &iscope, "iscope", log, up)
             })
             .await;
 
             match result {
-                Ok(Ok(())) => { let _ = tx2.send(TaskMsg::Done); }
-                Ok(Err(e)) => { let _ = tx2.send(TaskMsg::Error(e.to_string())); }
-                Err(e)     => { let _ = tx2.send(TaskMsg::Error(e.to_string())); }
+                Ok(Ok(())) => {
+                    let _ = tx2.send(TaskMsg::Done);
+                }
+                Ok(Err(e)) => {
+                    let _ = tx2.send(TaskMsg::Error(e.to_string()));
+                }
+                Err(e) => {
+                    let _ = tx2.send(TaskMsg::Error(e.to_string()));
+                }
             }
         });
     }
@@ -255,22 +296,32 @@ impl FirmwareTab {
 
         self.rt.spawn(async move {
             let tx_log = tx.clone();
-            let tx_up  = tx.clone();
+            let tx_up = tx.clone();
             let tx_ext = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let iscope = crate::firmware::extract_iscope(&apk, move |s| {
                     let _ = tx_ext.send(TaskMsg::Log(s));
                 })?;
-                let log = move |s: String| { let _ = tx_log.send(TaskMsg::Log(s)); };
-                let up  = move |d, t| { let _ = tx_up.send(TaskMsg::Progress(d, t)); };
+                let log = move |s: String| {
+                    let _ = tx_log.send(TaskMsg::Log(s));
+                };
+                let up = move |d, t| {
+                    let _ = tx_up.send(TaskMsg::Progress(d, t));
+                };
                 crate::firmware::upload_firmware(&host, &iscope, "iscope", log, up)
             })
             .await;
 
             match result {
-                Ok(Ok(())) => { let _ = tx.send(TaskMsg::Done); }
-                Ok(Err(e)) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
-                Err(e) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
+                Ok(Ok(())) => {
+                    let _ = tx.send(TaskMsg::Done);
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
+                Err(e) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
             }
         });
     }
@@ -288,18 +339,28 @@ impl FirmwareTab {
 
         self.rt.spawn(async move {
             let tx_log = tx.clone();
-            let tx_up  = tx.clone();
+            let tx_up = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let log = move |s: String| { let _ = tx_log.send(TaskMsg::Log(s)); };
-                let up  = move |d, t| { let _ = tx_up.send(TaskMsg::Progress(d, t)); };
+                let log = move |s: String| {
+                    let _ = tx_log.send(TaskMsg::Log(s));
+                };
+                let up = move |d, t| {
+                    let _ = tx_up.send(TaskMsg::Progress(d, t));
+                };
                 crate::firmware::upload_firmware_file(&host, &path, "iscope", log, up)
             })
             .await;
 
             match result {
-                Ok(Ok(())) => { let _ = tx.send(TaskMsg::Done); }
-                Ok(Err(e)) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
-                Err(e) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
+                Ok(Ok(())) => {
+                    let _ = tx.send(TaskMsg::Done);
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
+                Err(e) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
             }
         });
     }
@@ -374,8 +435,12 @@ impl PemTab {
                     let _ = tx.send(TaskMsg::PemKeys(r.keys));
                     let _ = tx.send(TaskMsg::Done);
                 }
-                Ok(Err(e)) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
-                Err(e) => { let _ = tx.send(TaskMsg::Error(e.to_string())); }
+                Ok(Err(e)) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
+                Err(e) => {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                }
             }
         });
     }
@@ -399,9 +464,7 @@ impl SeestarApp {
         );
         cc.egui_ctx.set_style(style);
 
-        let rt = Arc::new(
-            tokio::runtime::Runtime::new().expect("tokio runtime"),
-        );
+        let rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
 
         Self {
             tab: Tab::default(),
@@ -447,8 +510,16 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
     ui.horizontal(|ui| {
         ui.label("Source:");
         ui.selectable_value(&mut fw.source, FirmwareSource::LocalApk, "Local APK/XAPK");
-        ui.selectable_value(&mut fw.source, FirmwareSource::LocalIscope, "Local iscope file");
-        ui.selectable_value(&mut fw.source, FirmwareSource::Download, "Download from APKPure");
+        ui.selectable_value(
+            &mut fw.source,
+            FirmwareSource::LocalIscope,
+            "Local iscope file",
+        );
+        ui.selectable_value(
+            &mut fw.source,
+            FirmwareSource::Download,
+            "Download from APKPure",
+        );
     });
     ui.add_space(4.0);
 
@@ -505,8 +576,9 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
             // Fallback: paste a direct URL if the list couldn't load.
             ui.horizontal(|ui| {
                 ui.label("Direct URL:");
-                ui.text_edit_singleline(&mut fw.manual_url)
-                    .on_hover_text("Paste a direct XAPK download URL to use instead of the list above");
+                ui.text_edit_singleline(&mut fw.manual_url).on_hover_text(
+                    "Paste a direct XAPK download URL to use instead of the list above",
+                );
             });
         }
     }
@@ -519,28 +591,38 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
     ui.add_space(8.0);
 
     // Action buttons
-    ui.horizontal(|ui| {
-        match fw.source {
-            FirmwareSource::LocalApk => {
-                let ready = !fw.apk_path.is_empty() && !fw.busy;
-                if ui.add_enabled(ready, egui::Button::new("Update Seestar")).clicked() {
-                    fw.start_install_apk();
-                }
+    ui.horizontal(|ui| match fw.source {
+        FirmwareSource::LocalApk => {
+            let ready = !fw.apk_path.is_empty() && !fw.busy;
+            if ui
+                .add_enabled(ready, egui::Button::new("Update Seestar"))
+                .clicked()
+            {
+                fw.start_install_apk();
             }
-            FirmwareSource::LocalIscope => {
-                let ready = !fw.iscope_path.is_empty() && !fw.busy;
-                if ui.add_enabled(ready, egui::Button::new("Update Seestar")).clicked() {
-                    fw.start_install_iscope();
-                }
+        }
+        FirmwareSource::LocalIscope => {
+            let ready = !fw.iscope_path.is_empty() && !fw.busy;
+            if ui
+                .add_enabled(ready, egui::Button::new("Update Seestar"))
+                .clicked()
+            {
+                fw.start_install_iscope();
             }
-            FirmwareSource::Download => {
-                let ready = fw.resolved_version().is_some() && !fw.busy;
-                if ui.add_enabled(ready, egui::Button::new("Download only")).clicked() {
-                    fw.start_download();
-                }
-                if ui.add_enabled(ready, egui::Button::new("Download & Install")).clicked() {
-                    fw.start_download_and_install();
-                }
+        }
+        FirmwareSource::Download => {
+            let ready = fw.resolved_version().is_some() && !fw.busy;
+            if ui
+                .add_enabled(ready, egui::Button::new("Download only"))
+                .clicked()
+            {
+                fw.start_download();
+            }
+            if ui
+                .add_enabled(ready, egui::Button::new("Download & Install"))
+                .clicked()
+            {
+                fw.start_download_and_install();
             }
         }
     });
@@ -555,7 +637,7 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
         } else {
             // Indeterminate — use a slow animated sine wave.
             let t = ui.ctx().input(|i| i.time) as f32;
-            (t.sin() * 0.5 + 0.5)
+            t.sin() * 0.5 + 0.5
         };
         ui.add(egui::ProgressBar::new(frac).show_percentage());
     }
@@ -601,7 +683,10 @@ fn draw_pem(ui: &mut egui::Ui, pem: &mut PemTab) {
     ui.add_space(8.0);
 
     let ready = !pem.apk_path.is_empty() && !pem.busy;
-    if ui.add_enabled(ready, egui::Button::new("Extract PEM")).clicked() {
+    if ui
+        .add_enabled(ready, egui::Button::new("Extract PEM"))
+        .clicked()
+    {
         pem.start_extract();
     }
     ui.add_space(4.0);
@@ -650,8 +735,7 @@ fn draw_pem(ui: &mut egui::Ui, pem: &mut PemTab) {
                 {
                     match std::fs::write(&dest, format!("{}\n", key)) {
                         Ok(_) => {
-                            pem.save_status =
-                                Some(format!("Saved to {}", dest.display()));
+                            pem.save_status = Some(format!("Saved to {}", dest.display()));
                         }
                         Err(e) => {
                             pem.save_status = Some(format!("Save failed: {}", e));

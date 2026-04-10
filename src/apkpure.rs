@@ -1,8 +1,8 @@
-/// APKPure version list and XAPK downloading via the mobile API.
-///
-/// Uses `api.pureapk.com` with Android device headers — the same approach as
-/// the `apkeep` crate (EFF).  This endpoint is NOT behind the Cloudflare JS
-/// challenge that blocks ordinary browser-impersonation requests to the web UI.
+//! APKPure version list and XAPK downloading via the mobile API.
+//!
+//! Uses `api.pureapk.com` with Android device headers — the same approach as
+//! the `apkeep` crate (EFF).  This endpoint is NOT behind the Cloudflare JS
+//! challenge that blocks ordinary browser-impersonation requests to the web UI.
 
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -26,15 +26,20 @@ pub struct ApkVersion {
 /// Fetch available Seestar versions from the APKPure mobile API.
 pub async fn fetch_versions(progress: impl Fn(String)) -> Result<Vec<ApkVersion>> {
     progress("Querying APKPure mobile API…".to_string());
-    let url = format!("{}/app_version?hl=en-US&package_name={}", API_BASE, SEESTAR_PACKAGE);
+    let url = format!(
+        "{}/app_version?hl=en-US&package_name={}",
+        API_BASE, SEESTAR_PACKAGE
+    );
     let bytes = api_get(&url).await?;
     parse_protobuf_response(&bytes)
 }
 
 /// Fetch only the latest version — same endpoint, just return first result.
 pub async fn fetch_latest(progress: impl Fn(String)) -> Result<ApkVersion> {
-    let mut v = fetch_versions(progress).await?;
-    v.into_iter().next().ok_or_else(|| anyhow!("No version found in API response."))
+    let v = fetch_versions(progress).await?;
+    v.into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No version found in API response."))
 }
 
 async fn api_get(url: &str) -> Result<Vec<u8>> {
@@ -92,7 +97,10 @@ async fn stream_download(
         .get("content-disposition")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| {
-            Regex::new(r#"filename="?([^";]+)"?"#).ok()?.captures(s)?.get(1)
+            Regex::new(r#"filename="?([^";]+)"?"#)
+                .ok()?
+                .captures(s)?
+                .get(1)
                 .map(|m| m.as_str().to_string())
         })
         .unwrap_or_else(|| format!("Seestar_{}.xapk", version));
@@ -143,7 +151,11 @@ async fn stream_download(
             Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
             Ok(r) => return Err(anyhow!("HTTP {} during download", r.status())),
             Err(e) if attempt == MAX_RETRIES => {
-                return Err(anyhow!("Download failed after {} attempts: {}", MAX_RETRIES, e))
+                return Err(anyhow!(
+                    "Download failed after {} attempts: {}",
+                    MAX_RETRIES,
+                    e
+                ))
             }
             Err(_) => {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -207,10 +219,9 @@ fn parse_protobuf_response(data: &[u8]) -> Result<Vec<ApkVersion>> {
     // In the protobuf stream: field-tag byte, then "XAPKJ", then a 2-byte varint
     // length, then the URL string.  We match the literal "XAPKJ" and skip exactly
     // 2 bytes before capturing the URL.
-    let url_re = Regex::new(
-        r"XAPKJ.{2}(https://download\.pureapk\.com/b/XAPK/[A-Za-z0-9_.\-/?=&%:+]+)",
-    )
-    .unwrap();
+    let url_re =
+        Regex::new(r"XAPKJ.{2}(https://download\.pureapk\.com/b/XAPK/[A-Za-z0-9_.\-/?=&%:+]+)")
+            .unwrap();
 
     // Collect (byte-offset, version_name) for every version match.
     let ver_positions: Vec<(usize, String)> = ver_re
@@ -237,7 +248,10 @@ fn parse_protobuf_response(data: &[u8]) -> Result<Vec<ApkVersion>> {
             .unwrap_or_default();
 
         if !version.is_empty() && seen.insert(version.clone()) {
-            versions.push(ApkVersion { version, download_url: url });
+            versions.push(ApkVersion {
+                version,
+                download_url: url,
+            });
         }
     }
 

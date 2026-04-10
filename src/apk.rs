@@ -1,4 +1,4 @@
-/// APK/XAPK handling — mirrors apk_utils.py and the AXML parser in extract_pem.py.
+//! APK/XAPK handling — mirrors apk_utils.py and the AXML parser in extract_pem.py.
 
 use anyhow::{anyhow, Result};
 use std::io::{Cursor, Read};
@@ -46,12 +46,6 @@ impl ApkHandle {
         zip_from_bytes(self.data.clone())
     }
 
-    /// Check whether a path exists inside this APK.
-    pub fn contains(&self, path: &str) -> Result<bool> {
-        let names = self.file_names()?;
-        Ok(names.iter().any(|n| n == path))
-    }
-
     /// Read a named entry from this APK.
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
         let mut z = self.zip()?;
@@ -93,7 +87,10 @@ pub fn open_apk(path: &str, containing: &[&str]) -> Result<ApkHandle> {
         for entry in &apk_entries {
             let inner_data = read_entry(&mut outer, entry)?;
             let inner = zip_from_bytes(inner_data)?;
-            if containing.iter().any(|n| inner.file_names().any(|f| f == *n)) {
+            if containing
+                .iter()
+                .any(|n| inner.file_names().any(|f| f == *n))
+            {
                 found = Some(entry.clone());
                 break;
             }
@@ -120,10 +117,12 @@ pub fn parse_version_name(axml: &[u8]) -> Option<String> {
     use std::convert::TryInto;
 
     let u32_le = |buf: &[u8], off: usize| -> Option<u32> {
-        buf.get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        buf.get(off..off + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
     };
     let u16_le = |buf: &[u8], off: usize| -> Option<u16> {
-        buf.get(off..off + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+        buf.get(off..off + 2)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
     };
 
     // String pool starts at offset 8 (after 8-byte AXML file header).
@@ -184,10 +183,7 @@ pub fn parse_version_name(axml: &[u8]) -> Option<String> {
                         let v = axml.get(a_off + 8..a_off + 12)?;
                         i32::from_le_bytes(v.try_into().unwrap())
                     };
-                    if a_name == vn_idx as i32
-                        && a_raw >= 0
-                        && (a_raw as usize) < strings.len()
-                    {
+                    if a_name == vn_idx as i32 && a_raw >= 0 && (a_raw as usize) < strings.len() {
                         return Some(strings[a_raw as usize].clone());
                     }
                 }

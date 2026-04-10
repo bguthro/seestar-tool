@@ -1,8 +1,7 @@
-/// Firmware extraction and OTA upload.
-/// Mirrors extract_iscope() and upload_file()/wait_for_scope() from install_firmware.py.
+//! Firmware extraction and OTA upload.
+//! Mirrors extract_iscope() and upload_file()/wait_for_scope() from install_firmware.py.
 
 use anyhow::{anyhow, Result};
-use std::io::Read;
 use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -12,6 +11,8 @@ use crate::apk::open_apk;
 const UPDATER_CMD_PORT: u16 = 4350;
 const UPDATER_DATA_PORT: u16 = 4361;
 const ISCOPE_ASSETS: &[&str] = &["assets/iscope", "assets/iscope_64"];
+/// Typical time for the scope to install firmware before rebooting.
+const INSTALL_ESTIMATE_SECS: u64 = 180;
 
 // ── iscope extraction ─────────────────────────────────────────────────────────
 
@@ -61,12 +62,10 @@ pub fn upload_firmware(
     progress(format!("Connecting to {}…", address));
 
     // Connect data socket first, then command socket (order matters).
-    let mut s_data =
-        TcpStream::connect(format!("{}:{}", address, UPDATER_DATA_PORT))
-            .map_err(|e| anyhow!("Cannot connect to data port {}: {}", UPDATER_DATA_PORT, e))?;
-    let mut s_cmd =
-        TcpStream::connect(format!("{}:{}", address, UPDATER_CMD_PORT))
-            .map_err(|e| anyhow!("Cannot connect to command port {}: {}", UPDATER_CMD_PORT, e))?;
+    let mut s_data = TcpStream::connect(format!("{}:{}", address, UPDATER_DATA_PORT))
+        .map_err(|e| anyhow!("Cannot connect to data port {}: {}", UPDATER_DATA_PORT, e))?;
+    let mut s_cmd = TcpStream::connect(format!("{}:{}", address, UPDATER_CMD_PORT))
+        .map_err(|e| anyhow!("Cannot connect to command port {}: {}", UPDATER_CMD_PORT, e))?;
 
     s_cmd.set_read_timeout(Some(Duration::from_secs(10)))?;
 
@@ -115,7 +114,14 @@ pub fn upload_firmware(
     drop(s_cmd);
 
     progress("Firmware uploaded — scope is installing…".to_string());
-    wait_for_scope(address, UPDATER_CMD_PORT, Duration::from_secs(300), progress)?;
+    upload_progress(0, 0); // reset upload bar before wait phase
+    wait_for_scope(
+        address,
+        UPDATER_CMD_PORT,
+        Duration::from_secs(300),
+        progress,
+        upload_progress,
+    )?;
     Ok(())
 }
 
@@ -134,55 +140,64 @@ pub fn upload_firmware_file(
 // ── Scope availability polling ────────────────────────────────────────────────
 
 /// Wait for the scope to go offline (reboot) and come back online.
-/// Calls `progress` with human-readable status messages throughout.
+///
+/// `install_progress(done, total)` drives the egui progress bar:
+///   - `(elapsed, INSTALL_ESTIMATE_SECS)` → countdown bar during install
+///   - `(0, 0)` → indeterminate/bounce bar while rebooting or over-estimate
 fn wait_for_scope(
     address: &str,
     port: u16,
     timeout: Duration,
     progress: impl Fn(String),
+    install_progress: impl Fn(u64, u64),
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let t0 = Instant::now();
 
-    // Phase 1: wait until scope goes offline (it reboots after install).
+    // Phase 1: countdown bar while scope installs; switch to indeterminate once
+    // the estimate is exceeded.  Break when scope goes offline (reboot starts).
+    progress("Installing firmware…".to_string());
     loop {
         if Instant::now() >= deadline {
             return Err(anyhow!("Timed out waiting for scope to reboot"));
         }
         if !can_connect(address, port) {
             progress("Scope is rebooting…".to_string());
+            install_progress(0, 0);
             break;
         }
-        progress("Installing firmware…".to_string());
-        std::thread::sleep(Duration::from_millis(500));
+        let elapsed = t0.elapsed().as_secs();
+        if elapsed < INSTALL_ESTIMATE_SECS {
+            install_progress(elapsed, INSTALL_ESTIMATE_SECS);
+        } else {
+            install_progress(0, 0); // bounce / indeterminate
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Phase 2: wait until scope comes back.
-    let t1 = Instant::now();
+    // Phase 2: indeterminate bar while scope reboots and comes back online.
     loop {
         if Instant::now() >= deadline {
             return Err(anyhow!("Timed out waiting for scope to come back online"));
         }
         if can_connect(address, port) {
-            let elapsed = t1.elapsed().as_secs();
+            let elapsed = t0.elapsed().as_secs();
             progress(format!("Scope is back online! ({elapsed}s)"));
+            install_progress(0, 0);
             return Ok(());
         }
-        progress(format!(
-            "Waiting for scope to come back… ({:.0}s)",
-            t1.elapsed().as_secs_f32()
-        ));
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn can_connect(address: &str, port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &format!("{}:{}", address, port).parse().unwrap_or_else(|_| {
-            std::net::SocketAddr::from(([127, 0, 0, 1], port))
-        }),
-        Duration::from_secs(1),
-    )
-    .is_ok()
+    use std::net::ToSocketAddrs;
+    let Ok(addrs) = (address, port).to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok())
 }
 
 fn recv_line(stream: &mut TcpStream) -> Result<String> {
