@@ -8,8 +8,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Seestar Tool")
-            .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([480.0, 400.0]),
+            .with_inner_size([760.0, 620.0])
+            .with_min_inner_size([520.0, 440.0]),
         ..Default::default()
     };
 
