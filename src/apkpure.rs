@@ -304,3 +304,113 @@ fn android_client() -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A URL that satisfies the url_re character class.
+    const URL_1: &str = "https://download.pureapk.com/b/XAPK/com.zwo.seestar_3.1.1.xapk";
+    const URL_2: &str = "https://download.pureapk.com/b/XAPK/com.zwo.seestar_3.1.2.xapk";
+
+    /// Build a minimal protobuf-like byte blob: version string followed by
+    /// the "XAPKJ" marker + 2 separator bytes + URL.
+    fn entry(version: &str, url: &str) -> Vec<u8> {
+        let mut v: Vec<u8> = vec![0x00]; // non-word byte before version
+        v.extend_from_slice(version.as_bytes());
+        v.push(0x00); // non-word byte after version
+        v.extend_from_slice(b"XAPKJ\xaa\xbb"); // marker + 2 non-newline bytes
+        v.extend_from_slice(url.as_bytes());
+        v.push(0x00);
+        v
+    }
+
+    // ── parse_protobuf_response ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_empty_bytes_returns_error() {
+        assert!(parse_protobuf_response(b"").is_err());
+    }
+
+    #[test]
+    fn parse_version_without_url_returns_error() {
+        let data = b"\x003.1.1\x00no url here".to_vec();
+        assert!(parse_protobuf_response(&data).is_err());
+    }
+
+    #[test]
+    fn parse_url_without_preceding_version_returns_error() {
+        // URL appears before any version string → no pairing possible
+        let mut data: Vec<u8> = b"XAPKJ\xaa\xbb".to_vec();
+        data.extend_from_slice(URL_1.as_bytes());
+        data.extend_from_slice(b"\x00\x003.1.1\x00"); // version after URL
+        assert!(parse_protobuf_response(&data).is_err());
+    }
+
+    #[test]
+    fn parse_single_entry() {
+        let data = entry("3.1.1", URL_1);
+        let versions = parse_protobuf_response(&data).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "3.1.1");
+        assert_eq!(versions[0].download_url, URL_1);
+    }
+
+    #[test]
+    fn parse_multiple_entries_preserves_order() {
+        let mut data = entry("3.1.2", URL_2);
+        data.extend_from_slice(&entry("3.1.1", URL_1));
+        let versions = parse_protobuf_response(&data).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, "3.1.2");
+        assert_eq!(versions[1].version, "3.1.1");
+    }
+
+    #[test]
+    fn parse_deduplicates_same_version() {
+        // Same version appearing twice — only the first URL should be kept.
+        let mut data = entry("3.1.1", URL_1);
+        data.extend_from_slice(&entry("3.1.1", URL_2));
+        let versions = parse_protobuf_response(&data).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].download_url, URL_1);
+    }
+
+    #[test]
+    fn parse_ignores_non_matching_url_pattern() {
+        // A URL that doesn't start with the expected prefix is not captured.
+        let mut data: Vec<u8> = vec![0x00];
+        data.extend_from_slice(b"3.1.1\x00");
+        data.extend_from_slice(b"XAPKJ\xaa\xbbhttps://example.com/something.xapk\x00");
+        assert!(parse_protobuf_response(&data).is_err());
+    }
+
+    #[test]
+    fn parse_version_regex_requires_dotted_triplet() {
+        // A plain integer is not a valid version — no URL should be paired.
+        let mut data: Vec<u8> = vec![0x00];
+        data.extend_from_slice(b"311\x00"); // no dots
+        data.extend_from_slice(b"XAPKJ\xaa\xbb");
+        data.extend_from_slice(URL_1.as_bytes());
+        data.push(0x00);
+        assert!(parse_protobuf_response(&data).is_err());
+    }
+
+    // ── android_client ────────────────────────────────────────────────────────
+
+    #[test]
+    fn android_client_builds_successfully() {
+        assert!(android_client().is_ok());
+    }
+
+    // ── download_version ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn download_version_empty_url_returns_error() {
+        let tmp = std::env::temp_dir().join("seestar_dl_test");
+        let result = download_version("3.1.1", "", &tmp, |_, _| {}).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("No download URL"));
+    }
+}

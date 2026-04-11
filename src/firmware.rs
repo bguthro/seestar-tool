@@ -190,7 +190,7 @@ fn wait_for_scope(
     }
 }
 
-fn can_connect(address: &str, port: u16) -> bool {
+pub(crate) fn can_connect(address: &str, port: u16) -> bool {
     use std::net::ToSocketAddrs;
     let Ok(addrs) = (address, port).to_socket_addrs() else {
         return false;
@@ -200,7 +200,7 @@ fn can_connect(address: &str, port: u16) -> bool {
         .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok())
 }
 
-fn recv_line(stream: &mut TcpStream) -> Result<String> {
+pub(crate) fn recv_line(stream: &mut TcpStream) -> Result<String> {
     use std::io::Read;
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
@@ -217,4 +217,77 @@ fn recv_line(stream: &mut TcpStream) -> Result<String> {
         }
     }
     Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+
+    fn serve_once(data: &'static [u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.write_all(data).unwrap();
+        });
+        addr
+    }
+
+    // ── recv_line ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn recv_line_reads_up_to_newline() {
+        let addr = serve_once(b"hello world\n");
+        let mut client = TcpStream::connect(addr).unwrap();
+        assert_eq!(recv_line(&mut client).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn recv_line_trims_carriage_return() {
+        let addr = serve_once(b"hello\r\n");
+        let mut client = TcpStream::connect(addr).unwrap();
+        assert_eq!(recv_line(&mut client).unwrap(), "hello");
+    }
+
+    #[test]
+    fn recv_line_eof_without_newline_returns_partial() {
+        let addr = serve_once(b"partial");
+        let mut client = TcpStream::connect(addr).unwrap();
+        assert_eq!(recv_line(&mut client).unwrap(), "partial");
+    }
+
+    #[test]
+    fn recv_line_empty_connection_returns_empty() {
+        let addr = serve_once(b"");
+        let mut client = TcpStream::connect(addr).unwrap();
+        assert_eq!(recv_line(&mut client).unwrap(), "");
+    }
+
+    // ── can_connect ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn can_connect_true_when_listener_active() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Listener is still bound — connection should succeed.
+        assert!(can_connect("127.0.0.1", port));
+        drop(listener);
+    }
+
+    #[test]
+    fn can_connect_false_when_nothing_listening() {
+        // Bind then immediately drop to free the port.
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!can_connect("127.0.0.1", port));
+    }
+
+    #[test]
+    fn can_connect_false_for_unresolvable_host() {
+        assert!(!can_connect("invalid.host.that.does.not.exist.local", 9999));
+    }
 }
