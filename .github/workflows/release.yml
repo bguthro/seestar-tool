@@ -148,6 +148,7 @@ jobs:
           # Documentation
           mkdir -p "${PKG}/usr/share/doc/seestar-tool"
           cp README.md "${PKG}/usr/share/doc/seestar-tool/README.md"
+          cp LICENSE "${PKG}/usr/share/doc/seestar-tool/copyright"
 
           # Install hicolor icons at each standard size
           for size in 16 32 48 64 128 256; do
@@ -266,6 +267,7 @@ jobs:
           mkdir dmg_staging
           cp -r SeestarTool.app dmg_staging/
           cp README.md dmg_staging/README.md
+          cp LICENSE dmg_staging/LICENSE
           # Symlink to /Applications for drag-install UX
           ln -s /Applications dmg_staging/Applications
 
@@ -294,8 +296,8 @@ jobs:
           $VERSION = "${{ needs.determine-version.outputs.version }}"
           $SRC = "target\${{ matrix.target }}\release\seestar-tool.exe"
           $ZIP = "seestar-tool-${{ matrix.target }}-${VERSION}.zip"
-          # Bundle exe + ico + README together
-          Compress-Archive -Path $SRC, "assets\icons\seestar-tool.ico", "README.md" -DestinationPath $ZIP
+          # Bundle exe + ico + README + LICENSE together
+          Compress-Archive -Path $SRC, "assets\icons\seestar-tool.ico", "README.md", "LICENSE" -DestinationPath $ZIP
           $size = (Get-Item $ZIP).Length / 1MB
           Write-Host "Built: $ZIP ($([math]::Round($size, 1)) MB)"
 
