@@ -13,7 +13,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap,
+};
 use ratatui::Terminal;
 
 use crate::apkpure::ApkVersion;
@@ -52,6 +54,155 @@ enum Focus {
     Logs,
 }
 
+// ── file browser ──────────────────────────────────────────────────────────────
+
+/// Which path field the file browser was opened from.
+#[derive(Clone, Copy, PartialEq)]
+enum BrowserTarget {
+    Apk,
+    Iscope,
+    Pem,
+}
+
+struct FileBrowser {
+    cwd: PathBuf,
+    /// `(display_name, full_path, is_dir)`
+    entries: Vec<(String, PathBuf, bool)>,
+    state: ListState,
+    target: BrowserTarget,
+    /// file-extension filter (empty = show all files)
+    filter: &'static [&'static str],
+}
+
+impl FileBrowser {
+    fn open(start: &str, target: BrowserTarget, filter: &'static [&'static str]) -> Self {
+        let cwd = {
+            let p = PathBuf::from(start);
+            if p.is_dir() {
+                p
+            } else if let Some(parent) = p.parent() {
+                if parent.as_os_str().is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                } else {
+                    parent.to_path_buf()
+                }
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            }
+        };
+        let mut browser = Self {
+            cwd,
+            entries: vec![],
+            state: ListState::default(),
+            target,
+            filter,
+        };
+        browser.reload();
+        browser
+    }
+
+    fn reload(&mut self) {
+        self.entries.clear();
+
+        // always offer ".." unless already at root
+        if self.cwd.parent().is_some() {
+            if let Some(parent) = self.cwd.parent() {
+                self.entries
+                    .push(("..".to_string(), parent.to_path_buf(), true));
+            }
+        }
+
+        let mut dirs: Vec<(String, PathBuf)> = vec![];
+        let mut files: Vec<(String, PathBuf)> = vec![];
+
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                // skip hidden files
+                if name.starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs.push((name, path));
+                } else if self.filter.is_empty()
+                    || path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| self.filter.contains(&e))
+                        .unwrap_or(false)
+                {
+                    files.push((name, path));
+                }
+            }
+        }
+
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, path) in dirs {
+            self.entries.push((format!("{}/", name), path, true));
+        }
+        for (name, path) in files {
+            self.entries.push((name, path, false));
+        }
+
+        if self.entries.is_empty() {
+            self.state.select(None);
+        } else {
+            let cur = self
+                .state
+                .selected()
+                .unwrap_or(0)
+                .min(self.entries.len() - 1);
+            self.state.select(Some(cur));
+        }
+    }
+
+    fn selected_path(&self) -> Option<&PathBuf> {
+        self.state.selected().map(|i| &self.entries[i].1)
+    }
+
+    fn selected_is_dir(&self) -> bool {
+        self.state
+            .selected()
+            .map(|i| self.entries[i].2)
+            .unwrap_or(false)
+    }
+
+    fn enter(&mut self) -> Option<PathBuf> {
+        if self.selected_is_dir() {
+            if let Some(path) = self.selected_path().cloned() {
+                self.cwd = path;
+                self.state.select(Some(0));
+                self.reload();
+            }
+            None
+        } else {
+            self.selected_path().cloned()
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.cwd.parent() {
+            self.cwd = parent.to_path_buf();
+            self.state.select(Some(0));
+            self.reload();
+        }
+    }
+
+    fn move_up(&mut self) {
+        let i = self.state.selected().unwrap_or(0);
+        self.state.select(Some(i.saturating_sub(1)));
+    }
+
+    fn move_down(&mut self) {
+        let i = self.state.selected().unwrap_or(0);
+        let max = self.entries.len().saturating_sub(1);
+        self.state.select(Some((i + 1).min(max)));
+    }
+}
+
 // ── app state ─────────────────────────────────────────────────────────────────
 
 struct App {
@@ -80,11 +231,14 @@ struct App {
     rx: task::Receiver,
     rt: Arc<tokio::runtime::Runtime>,
 
-    // text editing cursor positions (simple)
+    // text editing cursor positions
     apk_cursor: usize,
     iscope_cursor: usize,
     host_cursor: usize,
     pem_cursor: usize,
+
+    // file browser overlay
+    file_browser: Option<FileBrowser>,
 
     quit: bool,
 }
@@ -113,9 +267,9 @@ impl App {
             iscope_cursor: 0,
             host_cursor: "seestar.local".len(),
             pem_cursor: 0,
+            file_browser: None,
             quit: false,
         };
-        // pre-fetch versions
         app.start_fetch_versions(tx);
         app
     }
@@ -305,6 +459,45 @@ impl App {
         }
     }
 
+    // ── file browser helpers ──────────────────────────────────────────────────
+
+    fn open_browser_for_focus(&mut self) {
+        let (target, start, filter): (BrowserTarget, &str, &'static [&'static str]) = match self
+            .focus
+        {
+            Focus::FilePath => match self.fw_source {
+                FirmwareSource::LocalApk => (BrowserTarget::Apk, &self.apk_path, &["apk", "xapk"]),
+                FirmwareSource::LocalIscope => {
+                    (BrowserTarget::Iscope, &self.iscope_path, &["iscope"])
+                }
+                FirmwareSource::Download => return,
+            },
+            Focus::PemFilePath => (BrowserTarget::Pem, &self.pem_path, &["apk", "xapk"]),
+            _ => return,
+        };
+        self.file_browser = Some(FileBrowser::open(start, target, filter));
+    }
+
+    fn apply_browser_selection(&mut self, path: PathBuf) {
+        let s = path.to_string_lossy().to_string();
+        match self.file_browser.as_ref().map(|b| b.target) {
+            Some(BrowserTarget::Apk) => {
+                self.apk_cursor = s.len();
+                self.apk_path = s;
+            }
+            Some(BrowserTarget::Iscope) => {
+                self.iscope_cursor = s.len();
+                self.iscope_path = s;
+            }
+            Some(BrowserTarget::Pem) => {
+                self.pem_cursor = s.len();
+                self.pem_path = s;
+            }
+            None => {}
+        }
+        self.file_browser = None;
+    }
+
     // ── key handling ──────────────────────────────────────────────────────────
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -320,9 +513,48 @@ impl App {
             _ => {}
         }
 
+        // File browser consumes all keys when open
+        if self.file_browser.is_some() {
+            self.handle_key_browser(code);
+            return;
+        }
+
         match self.tab {
             Tab::Firmware => self.handle_key_firmware(code, modifiers),
             Tab::ExtractPem => self.handle_key_pem(code, modifiers),
+        }
+    }
+
+    fn handle_key_browser(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.file_browser = None;
+            }
+            KeyCode::Up => {
+                if let Some(b) = self.file_browser.as_mut() {
+                    b.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(b) = self.file_browser.as_mut() {
+                    b.move_down();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(b) = self.file_browser.as_mut() {
+                    b.go_up();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(b) = self.file_browser.as_mut() {
+                    if let Some(selected) = b.enter() {
+                        // file selected — close browser and apply
+                        self.apply_browser_selection(selected);
+                    }
+                    // directory was entered; browser stays open
+                }
+            }
+            _ => {}
         }
     }
 
@@ -347,6 +579,21 @@ impl App {
                 _ => {}
             },
             Focus::FilePath => {
+                match code {
+                    KeyCode::Enter => {
+                        self.open_browser_for_focus();
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        if self.fw_source == FirmwareSource::Download {
+                            self.focus = Focus::VersionList;
+                        } else {
+                            self.focus = Focus::Host;
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let (s, cur) = self.active_path_mut();
                 match code {
                     KeyCode::Char(c) => {
@@ -364,13 +611,6 @@ impl App {
                         let len = s.len();
                         if *cur < len {
                             *cur += 1;
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if self.fw_source == FirmwareSource::Download {
-                            self.focus = Focus::VersionList;
-                        } else {
-                            self.focus = Focus::Host;
                         }
                     }
                     _ => {}
@@ -426,26 +666,38 @@ impl App {
 
     fn handle_key_pem(&mut self, code: KeyCode, _mods: KeyModifiers) {
         match self.focus {
-            Focus::PemFilePath => match code {
-                KeyCode::Char(c) => {
-                    self.pem_path.insert(self.pem_cursor, c);
-                    self.pem_cursor += 1;
-                }
-                KeyCode::Backspace => {
-                    if self.pem_cursor > 0 {
-                        self.pem_cursor -= 1;
-                        self.pem_path.remove(self.pem_cursor);
+            Focus::PemFilePath => {
+                match code {
+                    KeyCode::Enter => {
+                        self.open_browser_for_focus();
+                        return;
                     }
+                    KeyCode::Tab => {
+                        self.focus = Focus::PemButton;
+                        return;
+                    }
+                    _ => {}
                 }
-                KeyCode::Left => self.pem_cursor = self.pem_cursor.saturating_sub(1),
-                KeyCode::Right => {
-                    if self.pem_cursor < self.pem_path.len() {
+                match code {
+                    KeyCode::Char(c) => {
+                        self.pem_path.insert(self.pem_cursor, c);
                         self.pem_cursor += 1;
                     }
+                    KeyCode::Backspace => {
+                        if self.pem_cursor > 0 {
+                            self.pem_cursor -= 1;
+                            self.pem_path.remove(self.pem_cursor);
+                        }
+                    }
+                    KeyCode::Left => self.pem_cursor = self.pem_cursor.saturating_sub(1),
+                    KeyCode::Right => {
+                        if self.pem_cursor < self.pem_path.len() {
+                            self.pem_cursor += 1;
+                        }
+                    }
+                    _ => {}
                 }
-                KeyCode::Tab => self.focus = Focus::PemButton,
-                _ => {}
-            },
+            }
             Focus::PemButton => match code {
                 KeyCode::Enter | KeyCode::Char(' ') => self.run_pem(),
                 KeyCode::Char('s') => self.save_pem(),
@@ -466,7 +718,7 @@ impl App {
         match self.fw_source {
             FirmwareSource::LocalApk => (&mut self.apk_path, &mut self.apk_cursor),
             FirmwareSource::LocalIscope => (&mut self.iscope_path, &mut self.iscope_cursor),
-            FirmwareSource::Download => (&mut self.apk_path, &mut self.apk_cursor), // unused
+            FirmwareSource::Download => (&mut self.apk_path, &mut self.apk_cursor),
         }
     }
 }
@@ -484,7 +736,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
-    // main tab bar
     let tab_titles = ["Firmware Update", "Extract PEM"];
     let selected_tab = match app.tab {
         Tab::Firmware => 0,
@@ -509,12 +760,16 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     )
     .style(Style::default().fg(Color::DarkGray));
 
-    // Tab switching with F1/F2 or 1/2 when not in a text field
     f.render_widget(tabs, top_chunks[0]);
 
     match app.tab {
         Tab::Firmware => draw_firmware(f, app, top_chunks[1]),
         Tab::ExtractPem => draw_pem(f, app, top_chunks[1]),
+    }
+
+    // File browser overlay (drawn on top)
+    if app.file_browser.is_some() {
+        draw_file_browser(f, app, area);
     }
 }
 
@@ -540,7 +795,7 @@ fn draw_firmware(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         FirmwareSource::LocalIscope => 1,
         FirmwareSource::Download => 2,
     };
-    let src_style = if app.focus == Focus::SourceTabs {
+    let src_style = if app.focus == Focus::SourceTabs && app.file_browser.is_none() {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -562,32 +817,31 @@ fn draw_firmware(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_widget(src_tabs, chunks[0]);
 
     // ── file path / version list ─────────────────────────────────────────────
+    let path_focused = app.focus == Focus::FilePath && app.file_browser.is_none();
     match app.fw_source {
         FirmwareSource::LocalApk => {
             draw_text_input(
                 f,
                 chunks[1],
-                "APK / XAPK Path",
+                "APK / XAPK Path  [Enter = browse]",
                 &app.apk_path,
                 app.apk_cursor,
-                app.focus == Focus::FilePath,
+                path_focused,
             );
-            // blank version list area
             f.render_widget(Block::default(), chunks[2]);
         }
         FirmwareSource::LocalIscope => {
             draw_text_input(
                 f,
                 chunks[1],
-                "iscope Path",
+                "iscope Path  [Enter = browse]",
                 &app.iscope_path,
                 app.iscope_cursor,
-                app.focus == Focus::FilePath,
+                path_focused,
             );
             f.render_widget(Block::default(), chunks[2]);
         }
         FirmwareSource::Download => {
-            // header in [1], list in [2]
             let hdr = Paragraph::new("Select a version (↑↓ to move, Tab to continue):")
                 .style(Style::default().fg(Color::DarkGray));
             f.render_widget(hdr, chunks[1]);
@@ -606,7 +860,7 @@ fn draw_firmware(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 })
                 .collect();
 
-            let list_style = if app.focus == Focus::VersionList {
+            let list_style = if app.focus == Focus::VersionList && app.file_browser.is_none() {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default()
@@ -636,12 +890,12 @@ fn draw_firmware(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         "Seestar Host/IP (leave blank to download only)",
         &app.host,
         app.host_cursor,
-        app.focus == Focus::Host,
+        app.focus == Focus::Host && app.file_browser.is_none(),
     );
 
     // ── action button ────────────────────────────────────────────────────────
     let btn_label = app.action_label();
-    let btn_style = if app.focus == Focus::ActionButton {
+    let btn_style = if app.focus == Focus::ActionButton && app.file_browser.is_none() {
         Style::default()
             .fg(Color::Black)
             .bg(Color::Yellow)
@@ -659,10 +913,7 @@ fn draw_firmware(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(btn, chunks[4]);
 
-    // ── logs ─────────────────────────────────────────────────────────────────
     draw_logs(f, app, chunks[5]);
-
-    // ── progress ─────────────────────────────────────────────────────────────
     draw_progress(f, app, chunks[6]);
 }
 
@@ -681,19 +932,18 @@ fn draw_pem(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     draw_text_input(
         f,
         chunks[0],
-        "APK / XAPK Path",
+        "APK / XAPK Path  [Enter = browse]",
         &app.pem_path,
         app.pem_cursor,
-        app.focus == Focus::PemFilePath,
+        app.focus == Focus::PemFilePath && app.file_browser.is_none(),
     );
 
-    // buttons
     let btn_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
 
-    let extract_style = if app.focus == Focus::PemButton {
+    let extract_style = if app.focus == Focus::PemButton && app.file_browser.is_none() {
         Style::default()
             .fg(Color::Black)
             .bg(Color::Yellow)
@@ -720,7 +970,6 @@ fn draw_pem(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(save_btn, btn_chunks[1]);
 
-    // key preview or logs
     if !app.pem_keys.is_empty() {
         let key_text: Vec<Line> = app
             .pem_keys
@@ -749,6 +998,77 @@ fn draw_pem(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     draw_progress(f, app, chunks[3]);
 }
 
+fn draw_file_browser(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    // Center a popup that's 80% wide and 70% tall
+    let popup_width = (area.width * 4 / 5).max(40);
+    let popup_height = (area.height * 7 / 10).max(10);
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    if let Some(browser) = app.file_browser.as_mut() {
+        let cwd_str = browser.cwd.to_string_lossy();
+        let title = format!(" {} ", cwd_str);
+
+        let footer = Line::from(vec![
+            Span::styled(" ↑↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" navigate  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" open/select  "),
+            Span::styled("⌫", Style::default().fg(Color::Yellow)),
+            Span::raw(" parent  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" cancel "),
+        ]);
+
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(popup_area);
+
+        let items: Vec<ListItem> = browser
+            .entries
+            .iter()
+            .map(|(name, _, is_dir)| {
+                if *is_dir {
+                    ListItem::new(Line::from(Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )))
+                } else {
+                    ListItem::new(Line::from(Span::styled(
+                        name.clone(),
+                        Style::default().fg(Color::White),
+                    )))
+                }
+            })
+            .collect();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(title, Style::default().fg(Color::Yellow)));
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        f.render_stateful_widget(list, inner_chunks[0], &mut browser.state);
+        f.render_widget(Paragraph::new(footer), inner_chunks[1]);
+    }
+}
+
 fn draw_text_input(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -769,11 +1089,9 @@ fn draw_text_input(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // display: show cursor position
     let display = if focused && cursor <= value.len() {
         let (before, after) = value.split_at(cursor);
         let mut spans = vec![Span::raw(before.to_string())];
-        // cursor character or block
         if after.is_empty() {
             spans.push(Span::styled(
                 " ",
@@ -796,12 +1114,11 @@ fn draw_text_input(
         ))
     };
 
-    let par = Paragraph::new(display);
-    f.render_widget(par, inner);
+    f.render_widget(Paragraph::new(display), inner);
 }
 
 fn draw_logs(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let focused = app.focus == Focus::Logs;
+    let focused = app.focus == Focus::Logs && app.file_browser.is_none();
     let border_style = if focused {
         Style::default().fg(Color::Yellow)
     } else {
@@ -823,8 +1140,7 @@ fn draw_logs(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .rev()
         .map(|(style, msg)| Line::from(Span::styled(msg.clone(), *style)))
         .collect();
-    let par = Paragraph::new(lines);
-    f.render_widget(par, inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_progress(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -834,12 +1150,11 @@ fn draw_progress(f: &mut ratatui::Frame, app: &App, area: Rect) {
         }
         Some((done, total)) => {
             if total == 0 {
-                // indeterminate — show animated block
                 let label = if app.busy { "Working…" } else { "" };
                 let gauge = Gauge::default()
                     .block(Block::default().borders(Borders::ALL))
                     .gauge_style(Style::default().fg(Color::Blue).bg(Color::DarkGray))
-                    .ratio(0.5) // static half-fill as indeterminate indicator
+                    .ratio(0.5)
                     .label(label);
                 f.render_widget(gauge, area);
             } else {
@@ -880,18 +1195,23 @@ pub fn run(rt: Arc<tokio::runtime::Runtime>) -> anyhow::Result<()> {
         let timeout = tick.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
-                // Global: F1/F2 switch tabs (when not editing)
-                match key.code {
-                    KeyCode::F(1) => {
-                        app.tab = Tab::Firmware;
-                        app.focus = Focus::FilePath;
+                // Global tab switch with F1/F2 (only when browser is closed)
+                if app.file_browser.is_none() {
+                    match key.code {
+                        KeyCode::F(1) => {
+                            app.tab = Tab::Firmware;
+                            app.focus = Focus::FilePath;
+                            continue;
+                        }
+                        KeyCode::F(2) => {
+                            app.tab = Tab::ExtractPem;
+                            app.focus = Focus::PemFilePath;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    KeyCode::F(2) => {
-                        app.tab = Tab::ExtractPem;
-                        app.focus = Focus::PemFilePath;
-                    }
-                    _ => app.handle_key(key.code, key.modifiers),
                 }
+                app.handle_key(key.code, key.modifiers);
             }
         }
 
