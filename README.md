@@ -2,18 +2,38 @@
 
 A native desktop application for managing firmware on ZWO Seestar smart telescopes.
 
-Built with [egui](https://github.com/emilk/egui) and Rust.
+Built with [egui](https://github.com/emilk/egui) and Rust. Available as a GUI and a `--tui` terminal interface.
 
 ---
 
 ## Features
 
-- **Firmware Update** — install firmware directly from a local APK/XAPK file, a raw `iscope` binary, or downloaded from APKPure
+- **Firmware Update** — install firmware from a local APK/XAPK file, a raw `iscope` binary, or downloaded directly from APKPure
+- **Download Only** — fetch a firmware APK without immediately flashing it
 - **Extract PEM** — extract the TLS private key from a Seestar APK for use with local API access
 - Animated progress bar with installation countdown
 - Color-coded output log
+- Confirmation dialog before any firmware flash
 
-## Building
+## Installation
+
+Pre-built binaries are available on the [Releases](../../releases) page for:
+
+| Platform | File |
+|---|---|
+| macOS (Apple Silicon) | `seestar-tool-aarch64-apple-darwin-*.dmg` |
+| macOS (Intel) | `seestar-tool-x86_64-apple-darwin-*.dmg` |
+| Linux x86_64 | `seestar-tool_*_amd64.deb` |
+| Linux arm64 | `seestar-tool_*_arm64.deb` |
+| Windows x86_64 | `seestar-tool-x86_64-pc-windows-msvc-*.zip` |
+
+**macOS:** Open the `.dmg` and drag Seestar Tool to Applications.
+
+**Linux:** `sudo dpkg -i seestar-tool_*.deb`
+
+**Windows:** Extract the `.zip` and run `seestar-tool.exe`.
+
+## Building from source
 
 Requires the [Rust toolchain](https://rustup.rs/).
 
@@ -23,7 +43,28 @@ cargo build --release
 
 The binary will be at `target/release/seestar-tool`.
 
+**Linux** also requires GUI system libraries:
+
+```bash
+sudo apt-get install libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libfontconfig1-dev libgl1-mesa-dev
+```
+
 ## Usage
+
+### GUI (default)
+
+```bash
+seestar-tool
+```
+
+### Terminal UI
+
+```bash
+seestar-tool --tui
+```
+
+---
 
 ### Firmware Update
 
@@ -32,13 +73,15 @@ The binary will be at `target/release/seestar-tool`.
    - **Local iscope** — pick a raw extracted `iscope` firmware binary
    - **Download from APKPure** — fetch a version list and download directly
 2. Enter your Seestar's IP address or hostname (default: `seestar.local`)
-3. Click **Update Seestar** or **Download & Install**
+3. Click **Update Seestar** (or **Download & Install**) and confirm the dialog
 
-The app connects to the scope's OTA updater on port 4350/4361, uploads the firmware, and monitors the reboot. A progress bar counts down the estimated install time (~3 minutes), then waits for the scope to come back online.
+The app connects to the scope's OTA updater, uploads the firmware, and monitors the reboot. A progress bar counts down the estimated install time (~3 minutes), then waits for the scope to come back online.
 
 ### Extract PEM
 
-Pick a Seestar APK/XAPK and click **Extract PEM Key**. The key can be saved to a `.pem` file for use with local HTTPS API access.
+Pick a Seestar APK/XAPK and click **Extract PEM Key**. The extracted key can be saved to a `.pem` file.
+
+> **Interoperability Notice:** PEM key extraction is provided for interoperability purposes under 17 U.S.C. § 1201(f) (the DMCA interoperability exemption), enabling independent programs to interoperate with your Seestar device. The legality of key extraction and use varies by jurisdiction. You are solely responsible for ensuring compliance with the laws of your region.
 
 ---
 
