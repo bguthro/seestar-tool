@@ -33,6 +33,25 @@ Pre-built binaries are available on the [Releases](../../releases) page for:
 
 **Windows:** Extract the `.zip` and run `seestar-tool.exe`.
 
+### macOS: Gatekeeper Warning
+
+macOS may display:
+> Apple could not verify "SeestarTool" is free of malware that may harm your Mac or compromise your privacy.
+
+This occurs because the app is not code-signed. You can safely bypass this by:
+
+**Option 1: Right-click to open**
+1. Right-click (or Ctrl+click) the app in Finder
+2. Select **Open** from the context menu
+3. Click **Open** in the confirmation dialog
+
+**Option 2: Terminal command**
+```bash
+xattr -d com.apple.quarantine /Applications/SeestarTool.app
+```
+
+Then open the app normally. This removes the quarantine flag that triggers the warning.
+
 ## Building from source
 
 Requires the [Rust toolchain](https://rustup.rs/).
