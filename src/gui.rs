@@ -708,7 +708,12 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                         });
                     } else if fw.versions_loaded && !fw.versions.is_empty() {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Version").color(c_muted()).size(13.0));
+                            ui.add_sized(
+                                [70.0, 14.0],
+                                egui::Label::new(
+                                    RichText::new("Version").color(c_muted()).size(13.0),
+                                ),
+                            );
                             egui::ComboBox::from_id_salt("version_select")
                                 .selected_text(&fw.versions[fw.selected_version].version)
                                 .show_ui(ui, |ui| {
@@ -735,7 +740,12 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                     }
 
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Direct URL").color(c_muted()).size(13.0));
+                        ui.add_sized(
+                            [70.0, 14.0],
+                            egui::Label::new(
+                                RichText::new("Direct URL").color(c_muted()).size(13.0),
+                            ),
+                        );
                         ui.add(
                             egui::TextEdit::singleline(&mut fw.manual_url)
                                 .hint_text("Paste a direct XAPK download URL (optional fallback)")
@@ -744,7 +754,10 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Save to").color(c_muted()).size(13.0));
+                        ui.add_sized(
+                            [70.0, 14.0],
+                            egui::Label::new(RichText::new("Save to").color(c_muted()).size(13.0)),
+                        );
                         let btn_w = 100.0 + ui.spacing().item_spacing.x;
                         let te_w = (ui.available_width() - btn_w).max(60.0);
                         ui.add(
