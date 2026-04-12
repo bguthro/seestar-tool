@@ -89,7 +89,7 @@ seestar-tool --tui
 
 **Why APK?**
 
-Seestar runs firmware based on Android, so ZWO distributes firmware as APK (Android Package) files. An APK is a ZIP archive containing the firmware's binary executable, resources, and metadata. This tool extracts the actual firmware binary (`iscope`) from the APK and uploads it to your scope.
+ZWO distributes Seestar firmware bundled inside the Android companion app APK (Android Package). The app itself runs on your phone, but it also carries the telescope's firmware as an embedded asset. An APK is a ZIP archive, so this tool unpacks it, extracts the firmware binary (`iscope` or `iscope_64`), and uploads it directly to your scope.
 
 **APK vs. XAPK**
 
@@ -144,7 +144,7 @@ The author(s) of this software make no representations regarding the legality of
 
 ## Versions
 
-Known firmware version number mappings (courtesy of bguthro/seestar-tool#1):
+Known firmware version number mappings:
 
 | App version | asiair version_int | version_string |
 |---|---|---|
