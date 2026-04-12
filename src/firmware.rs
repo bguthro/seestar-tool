@@ -307,57 +307,14 @@ pub(crate) fn recv_line(stream: &mut TcpStream) -> Result<String> {
 
 // ── Model auto-detection ──────────────────────────────────────────────────────
 
-const API_PORT: u16 = 4700;
-
-/// Connect to the scope's JSON-RPC API and read `product_model` from
-/// `get_device_state`.
-///
-/// First tries port 4350 (the OTA updater port, always accessible) without
-/// authentication.  If that port doesn't return device state, falls back to
-/// port 4700 with RSA SHA1/PKCS1v15 challenge-response authentication.
+/// Connect to the scope's JSON-RPC API on port 4350 (the OTA updater port,
+/// always accessible), authenticate with RSA SHA1/PKCS1v15 challenge-response,
+/// and read `product_model` from `get_device_state`.
 ///
 /// Returns `ScopeModel::S30Pro` if the product_model contains "S30",
 /// otherwise `ScopeModel::S50`.
 pub fn detect_scope_model(address: &str, pem_key: &[u8]) -> Result<ScopeModel> {
-    // Try the OTA command port first (always open, no auth required).
-    if let Ok(model) = detect_via_updater_port(address) {
-        return Ok(model);
-    }
-    // Fall back to the API port with full authentication.
-    detect_scope_model_on_port(address, API_PORT, pem_key)
-}
-
-/// Try to read `get_device_state` from the OTA updater port (4350) without auth.
-fn detect_via_updater_port(address: &str) -> Result<ScopeModel> {
-    use std::io::Write;
-    use std::net::ToSocketAddrs;
-
-    let addr = (address, UPDATER_CMD_PORT)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("Cannot resolve {}", address))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| anyhow!("Cannot connect to {}:{}: {}", address, UPDATER_CMD_PORT, e))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-
-    // Read and discard the scope's greeting line.
-    let _greeting = recv_line(&mut stream)?;
-
-    // Request device state (no auth needed on this port for many firmware versions).
-    let req = serde_json::json!({"id":1,"method":"get_device_state","params":[]});
-    stream.write_all(format!("{}\r\n", req).as_bytes())?;
-    let resp = recv_line(&mut stream)?;
-    let resp_v: serde_json::Value =
-        serde_json::from_str(&resp).map_err(|_| anyhow!("Invalid JSON: {}", resp))?;
-    let product_model = resp_v["result"]["device"]["product_model"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No product_model in: {}", resp))?;
-
-    if product_model.contains("S30") {
-        Ok(ScopeModel::S30Pro)
-    } else {
-        Ok(ScopeModel::S50)
-    }
+    detect_scope_model_on_port(address, UPDATER_CMD_PORT, pem_key)
 }
 
 fn send_udp_intro(address: &str) {
@@ -982,7 +939,7 @@ mod tests {
     fn detect_scope_model_invalid_address_returns_error() {
         let pem = make_test_pem_key();
         let err =
-            detect_scope_model_on_port("this-host-does-not-exist.invalid", 4700, &pem).unwrap_err();
+            detect_scope_model_on_port("this-host-does-not-exist.invalid", 4350, &pem).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
