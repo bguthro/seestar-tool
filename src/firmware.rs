@@ -102,49 +102,46 @@ pub fn upload_firmware(
     progress: impl Fn(String) + Send + 'static,
     upload_progress: impl Fn(u64, u64) + Send + 'static,
 ) -> Result<()> {
-    upload_firmware_to_ports(
+    upload_firmware_inner(
         address,
         iscope_data,
         remote_filename,
-        UPDATER_CMD_PORT,
-        UPDATER_DATA_PORT,
+        UploadPorts::default(),
         progress,
         upload_progress,
     )
 }
 
-fn upload_firmware_to_ports(
-    address: &str,
-    iscope_data: &[u8],
-    remote_filename: &str,
-    cmd_port: u16,
-    data_port: u16,
-    progress: impl Fn(String) + Send + 'static,
-    upload_progress: impl Fn(u64, u64) + Send + 'static,
-) -> Result<()> {
-    upload_firmware_to_ports_with_timeout(
-        address,
-        iscope_data,
-        remote_filename,
-        cmd_port,
-        data_port,
-        Duration::from_secs(300),
-        progress,
-        upload_progress,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn upload_firmware_to_ports_with_timeout(
-    address: &str,
-    iscope_data: &[u8],
-    remote_filename: &str,
+/// Port and timeout configuration for the OTA upload — overridden in tests.
+struct UploadPorts {
     cmd_port: u16,
     data_port: u16,
     wait_timeout: Duration,
+}
+
+impl Default for UploadPorts {
+    fn default() -> Self {
+        Self {
+            cmd_port: UPDATER_CMD_PORT,
+            data_port: UPDATER_DATA_PORT,
+            wait_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+fn upload_firmware_inner(
+    address: &str,
+    iscope_data: &[u8],
+    remote_filename: &str,
+    ports: UploadPorts,
     progress: impl Fn(String) + Send + 'static,
     upload_progress: impl Fn(u64, u64) + Send + 'static,
 ) -> Result<()> {
+    let UploadPorts {
+        cmd_port,
+        data_port,
+        wait_timeout,
+    } = ports;
     let file_len = iscope_data.len();
     let fmd5 = format!("{:x}", md5::compute(iscope_data));
 
@@ -699,13 +696,15 @@ mod tests {
 
         let msgs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let msgs_capture = Arc::clone(&msgs);
-        let result = upload_firmware_to_ports_with_timeout(
+        let result = upload_firmware_inner(
             "127.0.0.1",
             b"fw",
             "iscope",
-            cmd_port,
-            data_port,
-            Duration::from_secs(5),
+            UploadPorts {
+                cmd_port,
+                data_port,
+                wait_timeout: Duration::from_secs(5),
+            },
             move |s| msgs_capture.lock().unwrap().push(s),
             |_, _| {},
         );
@@ -742,13 +741,15 @@ mod tests {
             }
         });
 
-        let result = upload_firmware_to_ports_with_timeout(
+        let result = upload_firmware_inner(
             "127.0.0.1",
             b"firmware payload",
             "iscope",
-            cmd_port,
-            data_port,
-            Duration::from_secs(5),
+            UploadPorts {
+                cmd_port,
+                data_port,
+                wait_timeout: Duration::from_secs(5),
+            },
             |_| {},
             |_, _| {},
         );
