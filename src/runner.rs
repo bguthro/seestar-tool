@@ -109,8 +109,10 @@ fn resolve_model(
              Load an APK file or select a model manually."
         ));
     };
-    let _ = tx.send(TaskMsg::Log("Auto-detecting model…".to_string()));
-    match crate::firmware::detect_scope_model(host, key) {
+    let tx_log = tx.clone();
+    match crate::firmware::detect_scope_model(host, key, move |s| {
+        let _ = tx_log.send(TaskMsg::Log(s));
+    }) {
         Ok(m) => {
             let _ = tx.send(TaskMsg::Log(format!("Auto-detected: {}", m.display_name())));
             Ok(m)

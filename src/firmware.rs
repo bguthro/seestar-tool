@@ -315,11 +315,20 @@ const API_PORT: u16 = 4700;
 ///
 /// Returns `ScopeModel::S30Pro` if the product_model contains "S30",
 /// otherwise `ScopeModel::S50`.
-pub fn detect_scope_model(address: &str, pem_key: &[u8]) -> Result<ScopeModel> {
-    detect_scope_model_on_port(address, API_PORT, pem_key)
+pub fn detect_scope_model(
+    address: &str,
+    pem_key: &[u8],
+    log: impl Fn(String),
+) -> Result<ScopeModel> {
+    detect_scope_model_on_port(address, API_PORT, pem_key, log)
 }
 
-fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Result<ScopeModel> {
+fn detect_scope_model_on_port(
+    address: &str,
+    port: u16,
+    pem_key: &[u8],
+    log: impl Fn(String),
+) -> Result<ScopeModel> {
     use base64::Engine;
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::DecodePrivateKey;
@@ -328,6 +337,7 @@ fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Resul
     use std::io::Write;
     use std::net::ToSocketAddrs;
 
+    log(format!("Connecting to {}:{}…", address, port));
     let addr = (address, port)
         .to_socket_addrs()?
         .next()
@@ -335,14 +345,18 @@ fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Resul
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| anyhow!("Cannot connect to {}:{}: {}", address, port, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    log("Connected".to_string());
 
     // Read scope greeting
-    let _greeting = recv_line(&mut stream)?;
+    let greeting = recv_line(&mut stream)?;
+    log(format!("Greeting: {}", greeting));
 
     // Step 1: get_verify_str — params must be the string "verify"
     let req = serde_json::json!({"id":1,"method":"get_verify_str","params":"verify"});
+    log(format!("-> {}", req));
     stream.write_all(format!("{}\r\n", req).as_bytes())?;
     let resp = recv_line(&mut stream)?;
+    log(format!("<- {}", resp));
     let resp_v: serde_json::Value =
         serde_json::from_str(&resp).map_err(|_| anyhow!("Invalid JSON from scope: {}", resp))?;
     // result may be {"str":"..."} or just the string directly
@@ -351,6 +365,7 @@ fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Resul
         .or_else(|| resp_v["result"].as_str())
         .ok_or_else(|| anyhow!("No challenge string in: {}", resp))?
         .to_string();
+    log(format!("Challenge: {}", challenge));
 
     // Sign challenge with RSA SHA1/PKCS1v15
     let pem_str = std::str::from_utf8(pem_key)?;
@@ -359,6 +374,10 @@ fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Resul
     let signing_key = SigningKey::<Sha1>::new(private_key);
     let signature = Signer::sign(&signing_key, challenge.as_bytes());
     let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+    log(format!(
+        "Signature (b64, first 20): {}…",
+        &sig_b64[..sig_b64.len().min(20)]
+    ));
 
     // Step 2: verify_client
     let verify_req = serde_json::json!({
@@ -366,8 +385,10 @@ fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Resul
         "method": "verify_client",
         "params": {"sign": sig_b64, "data": challenge}
     });
+    log("-> verify_client".to_string());
     stream.write_all(format!("{}\r\n", verify_req).as_bytes())?;
     let ack = recv_line(&mut stream)?;
+    log(format!("<- {}", ack));
     let ack_v: serde_json::Value =
         serde_json::from_str(&ack).map_err(|_| anyhow!("Invalid JSON from scope: {}", ack))?;
     if ack_v["code"].as_i64().unwrap_or(-1) != 0 {
@@ -380,8 +401,10 @@ fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Resul
 
     // Step 3: pi_is_verified — required to complete the handshake
     let pi_req = serde_json::json!({"id":3,"method":"pi_is_verified","params":"verify"});
+    log("-> pi_is_verified".to_string());
     stream.write_all(format!("{}\r\n", pi_req).as_bytes())?;
-    let _pi_ack = recv_line(&mut stream)?;
+    let pi_ack = recv_line(&mut stream)?;
+    log(format!("<- {}", pi_ack));
     // Non-zero result is non-fatal (seestar_alp also ignores it)
 
     // get_device_state
@@ -883,7 +906,7 @@ mod tests {
             .unwrap()
             .port();
         let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", port, &pem).unwrap_err();
+        let err = detect_scope_model_on_port("127.0.0.1", port, &pem, |_| {}).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -891,7 +914,7 @@ mod tests {
     fn detect_scope_model_auth_failure_returns_error() {
         let addr = serve_api_once("Seestar S50", 1); // code != 0 → auth fail
         let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("Authentication failed"),
             "expected auth error, got: {}",
@@ -903,7 +926,7 @@ mod tests {
     fn detect_scope_model_s50_product_model() {
         let addr = serve_api_once("Seestar S50", 0);
         let pem = make_test_pem_key();
-        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap();
+        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
         assert_eq!(model, ScopeModel::S50);
     }
 
@@ -911,7 +934,7 @@ mod tests {
     fn detect_scope_model_s30pro_product_model() {
         let addr = serve_api_once("Seestar S30 Pro", 0);
         let pem = make_test_pem_key();
-        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap();
+        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
         assert_eq!(model, ScopeModel::S30Pro);
     }
 
@@ -919,7 +942,7 @@ mod tests {
     fn detect_scope_model_s30_product_model() {
         let addr = serve_api_once("Seestar S30", 0);
         let pem = make_test_pem_key();
-        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap();
+        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
         assert_eq!(model, ScopeModel::S30Pro);
     }
 
@@ -927,8 +950,9 @@ mod tests {
     fn detect_scope_model_bad_pem_returns_error() {
         // A connected server is needed so we reach PEM loading.
         let addr = serve_api_once("Seestar S50", 0);
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), b"not a valid pem key")
-            .unwrap_err();
+        let err =
+            detect_scope_model_on_port("127.0.0.1", addr.port(), b"not a valid pem key", |_| {})
+                .unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -936,7 +960,8 @@ mod tests {
     fn detect_scope_model_invalid_address_returns_error() {
         let pem = make_test_pem_key();
         let err =
-            detect_scope_model_on_port("this-host-does-not-exist.invalid", 4700, &pem).unwrap_err();
+            detect_scope_model_on_port("this-host-does-not-exist.invalid", 4700, &pem, |_| {})
+                .unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -983,7 +1008,7 @@ mod tests {
     fn detect_scope_model_malformed_challenge_json_returns_error() {
         let addr = serve_bad_challenge(b"not-json-at-all\r\n");
         let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("Invalid JSON"),
             "expected invalid-JSON error, got: {}",
@@ -996,7 +1021,7 @@ mod tests {
         // Valid JSON but no result.str
         let addr = serve_bad_challenge(b"{\"id\":1,\"result\":{}}\r\n");
         let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("No challenge string"),
             "expected missing-challenge error, got: {}",
@@ -1009,7 +1034,7 @@ mod tests {
         // Auth succeeds but get_device_state has no product_model
         let addr = serve_bad_state(b"{\"id\":3,\"result\":{\"device\":{}}}\r\n");
         let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("No product_model"),
             "expected missing-product_model error, got: {}",
@@ -1021,7 +1046,7 @@ mod tests {
     fn detect_scope_model_malformed_state_json_returns_error() {
         let addr = serve_bad_state(b"garbage\r\n");
         let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("Invalid JSON"),
             "expected invalid-JSON error, got: {}",
