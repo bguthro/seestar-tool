@@ -20,6 +20,15 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+fn no_display(e: &str) -> bool {
+    e.contains("WAYLAND_DISPLAY")
+        || e.contains("WAYLAND_SOCKET")
+        || e.contains("DISPLAY")
+        || e.contains("os error")
+        || e.contains("EventLoopError")
+        || e.contains("NoAvailableAdapter")
+}
+
 fn main() -> anyhow::Result<()> {
     let use_tui = std::env::args().any(|a| a == "--tui");
 
@@ -37,12 +46,21 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Seestar Tool",
         options,
         Box::new(|cc| Ok(Box::new(gui::SeestarApp::new(cc)))),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    );
+
+    if let Err(e) = result {
+        let msg = e.to_string();
+        if no_display(&msg) {
+            eprintln!("No display available, falling back to TUI mode.");
+            let rt = std::sync::Arc::new(tokio::runtime::Runtime::new()?);
+            return tui::run(rt);
+        }
+        return Err(anyhow::anyhow!("{e}"));
+    }
 
     Ok(())
 }
