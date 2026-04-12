@@ -338,12 +338,23 @@ fn detect_scope_model_on_port(
     use std::net::ToSocketAddrs;
 
     log(format!("Connecting to {}:{}…", address, port));
-    let addr = (address, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("Cannot resolve {}", address))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| anyhow!("Cannot connect to {}:{}: {}", address, port, e))?;
+    let addrs: Vec<_> = (address, port).to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(anyhow!("Cannot resolve {}", address));
+    }
+    log(format!(
+        "Resolved {} address(es): {}",
+        addrs.len(),
+        addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let mut stream = addrs
+        .iter()
+        .find_map(|addr| TcpStream::connect_timeout(addr, Duration::from_secs(5)).ok())
+        .ok_or_else(|| anyhow!("Cannot connect to {}:{}: Connection refused", address, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     log("Connected".to_string());
 
