@@ -229,6 +229,12 @@ struct FirmwareTab {
     downloaded_apk: Option<PathBuf>,
     /// Set when user clicks an install button; cleared on confirm or cancel.
     confirm: Option<PendingAction>,
+    /// PEM private key bytes extracted from the loaded APK, used for auto-detection.
+    pem_key: Option<Vec<u8>>,
+    /// Background channel for PEM extraction (separate from install channel).
+    pem_rx: Option<Receiver>,
+    /// APK path we last started PEM extraction from, to avoid re-extracting.
+    last_pem_path: String,
 }
 
 impl FirmwareTab {
@@ -251,7 +257,25 @@ impl FirmwareTab {
             rt,
             downloaded_apk: None,
             confirm: None,
+            pem_key: None,
+            pem_rx: None,
+            last_pem_path: String::new(),
         }
+    }
+
+    /// If `apk_path` changed and the file exists, kick off a background PEM extraction.
+    fn maybe_refresh_pem(&mut self, apk_path: &str) {
+        if apk_path.is_empty() || apk_path == self.last_pem_path {
+            return;
+        }
+        if !std::path::Path::new(apk_path).exists() {
+            return;
+        }
+        self.last_pem_path = apk_path.to_string();
+        self.pem_key = None;
+        let (tx, rx) = channel();
+        self.pem_rx = Some(rx);
+        crate::runner::extract_pem(&self.rt, tx, apk_path.to_string());
     }
 
     fn poll(&mut self) {
@@ -273,6 +297,9 @@ impl FirmwareTab {
                 TaskMsg::Downloaded(p) => {
                     self.downloaded_apk = Some(p.clone());
                     self.log.push(format!("Downloaded: {}", p.display()));
+                    // Extract PEM from downloaded APK for auto-detection
+                    let path_str = p.to_string_lossy().to_string();
+                    self.maybe_refresh_pem(&path_str);
                 }
                 TaskMsg::Done => {
                     self.log.push("Done.".to_string());
@@ -285,6 +312,20 @@ impl FirmwareTab {
                     self.progress = (0, 0);
                 }
                 _ => {}
+            }
+        }
+
+        // Drain the background PEM extraction channel
+        let pem_msgs: Vec<TaskMsg> = self
+            .pem_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for msg in pem_msgs {
+            if let TaskMsg::PemKeys(keys) = msg
+                && let Some(key) = keys.into_iter().next()
+            {
+                self.pem_key = Some(key.into_bytes());
             }
         }
     }
@@ -353,6 +394,7 @@ impl FirmwareTab {
             dest_dir,
             host,
             self.model,
+            self.pem_key.clone(),
         );
     }
 
@@ -369,6 +411,7 @@ impl FirmwareTab {
             self.apk_path.clone(),
             self.seestar_host.clone(),
             self.model,
+            self.pem_key.clone(),
         );
     }
 
@@ -385,6 +428,7 @@ impl FirmwareTab {
             self.iscope_path.clone(),
             self.seestar_host.clone(),
             self.model,
+            self.pem_key.clone(),
         );
     }
 }
@@ -694,6 +738,10 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
         });
     });
 
+    // Trigger background PEM extraction whenever the APK path changes
+    let apk_path_snapshot = fw.apk_path.clone();
+    fw.maybe_refresh_pem(&apk_path_snapshot);
+
     ui.add_space(8.0);
 
     // Target + actions card
@@ -715,6 +763,10 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
 
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Model").color(c_muted()).size(13.0));
+                let auto_btn = source_btn(ui, &mut fw.model, ScopeModel::Auto, "Auto-detect");
+                if fw.pem_key.is_none() {
+                    auto_btn.on_hover_text("Load an APK file to enable auto-detection");
+                }
                 source_btn(ui, &mut fw.model, ScopeModel::S50, "S50");
                 source_btn(ui, &mut fw.model, ScopeModel::S30Pro, "S30 / S30 Pro");
             });
@@ -836,21 +888,25 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
     });
 }
 
-fn source_btn<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, variant: T, label: &str) {
+fn source_btn<T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    variant: T,
+    label: &str,
+) -> egui::Response {
     let active = *current == variant;
     let fill = if active { c_accent_dim() } else { c_surface2() };
     let text_color = if active { Color32::WHITE } else { c_muted() };
-    if ui
-        .add(
-            egui::Button::new(RichText::new(label).color(text_color).size(13.0))
-                .fill(fill)
-                .rounding(Rounding::same(5.0))
-                .min_size(egui::vec2(0.0, 26.0)),
-        )
-        .clicked()
-    {
+    let resp = ui.add(
+        egui::Button::new(RichText::new(label).color(text_color).size(13.0))
+            .fill(fill)
+            .rounding(Rounding::same(5.0))
+            .min_size(egui::vec2(0.0, 26.0)),
+    );
+    if resp.clicked() {
         *current = variant;
     }
+    resp
 }
 
 fn log_line_style(line: &str) -> (Color32, &'static str) {

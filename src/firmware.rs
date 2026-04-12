@@ -16,8 +16,10 @@ const INSTALL_ESTIMATE_SECS: u64 = 180;
 /// Which Seestar model is being updated — determines the firmware binary variant.
 #[derive(Clone, Copy, PartialEq, Default, Debug)]
 pub enum ScopeModel {
-    /// S50 and earlier — uses the 32-bit `iscope` binary.
+    /// Auto-detect the model from the scope's API before flashing.
     #[default]
+    Auto,
+    /// S50 and earlier — uses the 32-bit `iscope` binary.
     S50,
     /// S30 and S30 Pro — uses the 64-bit `iscope_64` binary.
     S30Pro,
@@ -25,18 +27,34 @@ pub enum ScopeModel {
 
 impl ScopeModel {
     /// The APK asset path for this model's firmware binary.
+    /// Panics if called on `Auto` (must be resolved first).
     pub fn asset_name(self) -> &'static str {
         match self {
             ScopeModel::S50 => "assets/iscope",
             ScopeModel::S30Pro => "assets/iscope_64",
+            ScopeModel::Auto => panic!("ScopeModel::Auto must be resolved before use"),
         }
     }
 
     /// The filename sent to the scope's OTA updater.
+    /// Panics if called on `Auto` (must be resolved first).
     pub fn remote_filename(self) -> &'static str {
         match self {
             ScopeModel::S50 => "iscope",
             ScopeModel::S30Pro => "iscope_64",
+            ScopeModel::Auto => panic!("ScopeModel::Auto must be resolved before use"),
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, ScopeModel::Auto)
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ScopeModel::Auto => "Auto",
+            ScopeModel::S50 => "S50",
+            ScopeModel::S30Pro => "S30 Pro",
         }
     }
 }
@@ -290,6 +308,93 @@ pub(crate) fn recv_line(stream: &mut TcpStream) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
+// ── Model auto-detection ──────────────────────────────────────────────────────
+
+const API_PORT: u16 = 4700;
+
+/// Connect to the scope's JSON-RPC API on port 4700, authenticate with the
+/// APK's RSA private key, and read `product_model` from `get_device_state`.
+///
+/// Returns `ScopeModel::S30Pro` if the product_model contains "S30",
+/// otherwise `ScopeModel::S50`.
+pub fn detect_scope_model(address: &str, pem_key: &[u8]) -> Result<ScopeModel> {
+    detect_scope_model_on_port(address, API_PORT, pem_key)
+}
+
+fn detect_scope_model_on_port(address: &str, port: u16, pem_key: &[u8]) -> Result<ScopeModel> {
+    use base64::Engine;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use sha1::Sha1;
+    use std::io::Write;
+    use std::net::ToSocketAddrs;
+
+    let addr = (address, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("Cannot resolve {}", address))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| anyhow!("Cannot connect to {}:{}: {}", address, port, e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+
+    // Read scope greeting
+    let _greeting = recv_line(&mut stream)?;
+
+    // get_verify_str
+    let req = serde_json::json!({"id":1,"method":"get_verify_str","params":[]});
+    stream.write_all(format!("{}\r\n", req).as_bytes())?;
+    let resp = recv_line(&mut stream)?;
+    let resp_v: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|_| anyhow!("Invalid JSON from scope: {}", resp))?;
+    let challenge = resp_v["result"]["str"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No challenge string in: {}", resp))?
+        .to_string();
+
+    // Sign challenge with RSA SHA1/PKCS1v15
+    let pem_str = std::str::from_utf8(pem_key)?;
+    let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(pem_str)
+        .map_err(|e| anyhow!("Failed to load PEM key: {}", e))?;
+    let signing_key = SigningKey::<Sha1>::new(private_key);
+    let signature = Signer::sign(&signing_key, challenge.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+
+    // verify_client
+    let verify_req = serde_json::json!({
+        "id": 2,
+        "method": "verify_client",
+        "params": [{"sign": sig_b64, "data": challenge}]
+    });
+    stream.write_all(format!("{}\r\n", verify_req).as_bytes())?;
+    let ack = recv_line(&mut stream)?;
+    let ack_v: serde_json::Value =
+        serde_json::from_str(&ack).map_err(|_| anyhow!("Invalid JSON from scope: {}", ack))?;
+    if ack_v["code"].as_i64().unwrap_or(-1) != 0 {
+        return Err(anyhow!(
+            "Authentication failed (code {}): {}",
+            ack_v["code"],
+            ack
+        ));
+    }
+
+    // get_device_state
+    let state_req = serde_json::json!({"id":3,"method":"get_device_state","params":[]});
+    stream.write_all(format!("{}\r\n", state_req).as_bytes())?;
+    let state_resp = recv_line(&mut stream)?;
+    let state_v: serde_json::Value = serde_json::from_str(&state_resp)
+        .map_err(|_| anyhow!("Invalid JSON from scope: {}", state_resp))?;
+    let product_model = state_v["result"]["device"]["product_model"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No product_model in: {}", state_resp))?;
+
+    if product_model.contains("S30") {
+        Ok(ScopeModel::S30Pro)
+    } else {
+        Ok(ScopeModel::S50)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,8 +448,22 @@ mod tests {
     // ── ScopeModel ────────────────────────────────────────────────────────────
 
     #[test]
-    fn scope_model_default_is_s50() {
-        assert_eq!(ScopeModel::default(), ScopeModel::S50);
+    fn scope_model_default_is_auto() {
+        assert_eq!(ScopeModel::default(), ScopeModel::Auto);
+    }
+
+    #[test]
+    fn scope_model_auto_is_auto() {
+        assert!(ScopeModel::Auto.is_auto());
+        assert!(!ScopeModel::S50.is_auto());
+        assert!(!ScopeModel::S30Pro.is_auto());
+    }
+
+    #[test]
+    fn scope_model_display_names() {
+        assert_eq!(ScopeModel::Auto.display_name(), "Auto");
+        assert_eq!(ScopeModel::S50.display_name(), "S50");
+        assert_eq!(ScopeModel::S30Pro.display_name(), "S30 Pro");
     }
 
     #[test]
@@ -681,6 +800,211 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Timed out waiting for scope to come back online")
+        );
+    }
+
+    // ── detect_scope_model ────────────────────────────────────────────────────
+
+    /// Spawn a mock API server that speaks the challenge-response protocol.
+    /// `product_model` is what the server reports in `get_device_state`.
+    /// `auth_code` is the code returned in the `verify_client` response.
+    fn serve_api_once(product_model: &'static str, auth_code: i64) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            // 1. Send greeting
+            conn.write_all(b"{\"name\":\"seestar-api\"}\r\n").unwrap();
+
+            // 2. Read get_verify_str, reply with challenge
+            recv_line(&mut conn).unwrap();
+            let challenge_resp =
+                serde_json::json!({"id":1,"result":{"str":"test-challenge-12345"}});
+            conn.write_all(format!("{}\r\n", challenge_resp).as_bytes())
+                .unwrap();
+
+            // 3. Read verify_client, reply with auth code
+            recv_line(&mut conn).unwrap();
+            let ack = serde_json::json!({"id":2,"code":auth_code});
+            conn.write_all(format!("{}\r\n", ack).as_bytes()).unwrap();
+
+            if auth_code != 0 {
+                return;
+            }
+
+            // 4. Read get_device_state, reply with product_model
+            recv_line(&mut conn).unwrap();
+            let state = serde_json::json!({
+                "id": 3,
+                "result": {"device": {"product_model": product_model}}
+            });
+            conn.write_all(format!("{}\r\n", state).as_bytes()).unwrap();
+        });
+        addr
+    }
+
+    fn make_test_pem_key() -> Vec<u8> {
+        use rsa::pkcs8::EncodePrivateKey;
+        let mut rng = rsa::rand_core::OsRng;
+        let key = rsa::RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn detect_scope_model_connection_refused_returns_error() {
+        // Bind then immediately drop to get a port that is guaranteed closed.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", port, &pem).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn detect_scope_model_auth_failure_returns_error() {
+        let addr = serve_api_once("Seestar S50", 1); // code != 0 → auth fail
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        assert!(
+            err.to_string().contains("Authentication failed"),
+            "expected auth error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_s50_product_model() {
+        let addr = serve_api_once("Seestar S50", 0);
+        let pem = make_test_pem_key();
+        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap();
+        assert_eq!(model, ScopeModel::S50);
+    }
+
+    #[test]
+    fn detect_scope_model_s30pro_product_model() {
+        let addr = serve_api_once("Seestar S30 Pro", 0);
+        let pem = make_test_pem_key();
+        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap();
+        assert_eq!(model, ScopeModel::S30Pro);
+    }
+
+    #[test]
+    fn detect_scope_model_s30_product_model() {
+        let addr = serve_api_once("Seestar S30", 0);
+        let pem = make_test_pem_key();
+        let model = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap();
+        assert_eq!(model, ScopeModel::S30Pro);
+    }
+
+    #[test]
+    fn detect_scope_model_bad_pem_returns_error() {
+        // A connected server is needed so we reach PEM loading.
+        let addr = serve_api_once("Seestar S50", 0);
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), b"not a valid pem key")
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn detect_scope_model_invalid_address_returns_error() {
+        let pem = make_test_pem_key();
+        let err =
+            detect_scope_model_on_port("this-host-does-not-exist.invalid", 4700, &pem).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// Spawn a server that sends a greeting then replies with `challenge_json`
+    /// to the first request (get_verify_str), then closes.
+    fn serve_bad_challenge(challenge_json: &'static [u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            conn.write_all(b"{\"name\":\"seestar-api\"}\r\n").unwrap();
+            recv_line(&mut conn).unwrap(); // consume get_verify_str
+            conn.write_all(challenge_json).unwrap();
+        });
+        addr
+    }
+
+    /// Spawn a server that completes auth successfully but sends `state_json`
+    /// instead of a proper get_device_state response.
+    fn serve_bad_state(state_json: &'static [u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            conn.write_all(b"{\"name\":\"seestar-api\"}\r\n").unwrap();
+            recv_line(&mut conn).unwrap();
+            let cr = serde_json::json!({"id":1,"result":{"str":"challenge"}});
+            conn.write_all(format!("{}\r\n", cr).as_bytes()).unwrap();
+            recv_line(&mut conn).unwrap();
+            conn.write_all(b"{\"id\":2,\"code\":0}\r\n").unwrap();
+            recv_line(&mut conn).unwrap();
+            conn.write_all(state_json).unwrap();
+        });
+        addr
+    }
+
+    #[test]
+    fn detect_scope_model_malformed_challenge_json_returns_error() {
+        let addr = serve_bad_challenge(b"not-json-at-all\r\n");
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid JSON"),
+            "expected invalid-JSON error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_missing_challenge_str_field_returns_error() {
+        // Valid JSON but no result.str
+        let addr = serve_bad_challenge(b"{\"id\":1,\"result\":{}}\r\n");
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        assert!(
+            err.to_string().contains("No challenge string"),
+            "expected missing-challenge error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_missing_product_model_field_returns_error() {
+        // Auth succeeds but get_device_state has no product_model
+        let addr = serve_bad_state(b"{\"id\":3,\"result\":{\"device\":{}}}\r\n");
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        assert!(
+            err.to_string().contains("No product_model"),
+            "expected missing-product_model error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_malformed_state_json_returns_error() {
+        let addr = serve_bad_state(b"garbage\r\n");
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid JSON"),
+            "expected invalid-JSON error, got: {}",
+            err
         );
     }
 

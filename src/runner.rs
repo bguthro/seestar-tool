@@ -68,7 +68,38 @@ pub fn download_only(
     });
 }
 
+/// Resolve `ScopeModel::Auto` by connecting to the scope and querying its model.
+/// Returns `Ok(resolved_model)` or `Err` on failure.
+fn resolve_model(
+    model: ScopeModel,
+    host: &str,
+    pem_key: Option<&[u8]>,
+    tx: &Sender,
+) -> anyhow::Result<ScopeModel> {
+    if !model.is_auto() {
+        return Ok(model);
+    }
+    let key = pem_key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Auto-detect requires an APK to extract the key from. \
+             Load an APK file or select a model manually."
+        )
+    })?;
+    let _ = tx.send(TaskMsg::Log("Auto-detecting model…".to_string()));
+    match crate::firmware::detect_scope_model(host, key) {
+        Ok(m) => {
+            let _ = tx.send(TaskMsg::Log(format!("Auto-detected: {}", m.display_name())));
+            Ok(m)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Could not auto-detect model: {}. Select a model manually.",
+            e
+        )),
+    }
+}
+
 /// Download an XAPK, extract the firmware, and upload it to the scope.
+#[allow(clippy::too_many_arguments)]
 pub fn download_and_install(
     rt: &Arc<tokio::runtime::Runtime>,
     tx: Sender,
@@ -77,6 +108,7 @@ pub fn download_and_install(
     dest_dir: PathBuf,
     host: String,
     model: ScopeModel,
+    pem_key: Option<Vec<u8>>,
 ) {
     rt.spawn(async move {
         let prog = {
@@ -101,6 +133,7 @@ pub fn download_and_install(
         let tx_log = tx.clone();
         let tx_up = tx.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let model = resolve_model(model, &host, pem_key.as_deref(), &tx_log)?;
             let iscope = crate::firmware::extract_iscope(
                 path.to_str().unwrap_or_default(),
                 model,
@@ -139,12 +172,14 @@ pub fn install_apk(
     apk_path: String,
     host: String,
     model: ScopeModel,
+    pem_key: Option<Vec<u8>>,
 ) {
     rt.spawn(async move {
         let tx_ext = tx.clone();
         let tx_log = tx.clone();
         let tx_up = tx.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let model = resolve_model(model, &host, pem_key.as_deref(), &tx_log)?;
             let iscope = crate::firmware::extract_iscope(&apk_path, model, move |s| {
                 let _ = tx_ext.send(TaskMsg::Log(s));
             })?;
@@ -179,12 +214,14 @@ pub fn install_iscope(
     iscope_path: String,
     host: String,
     model: ScopeModel,
+    pem_key: Option<Vec<u8>>,
 ) {
     rt.spawn(async move {
         let tx_done = tx.clone();
         let result = tokio::task::spawn_blocking(move || {
             let tx_log = tx.clone();
             let tx_up = tx.clone();
+            let model = resolve_model(model, &host, pem_key.as_deref(), &tx_log)?;
             let log = move |s: String| {
                 let _ = tx_log.send(TaskMsg::Log(s));
             };

@@ -313,6 +313,11 @@ struct App {
     rx: task::Receiver,
     rt: Arc<tokio::runtime::Runtime>,
 
+    // background PEM extraction for auto-detect
+    pem_key: Option<Vec<u8>>,
+    pem_rx: Option<task::Receiver>,
+    last_pem_path: String,
+
     // text editing cursor positions
     apk_cursor: usize,
     iscope_cursor: usize,
@@ -356,9 +361,26 @@ impl App {
             file_browser: None,
             confirm: None,
             quit: false,
+            pem_key: None,
+            pem_rx: None,
+            last_pem_path: String::new(),
         };
         app.start_fetch_versions(tx);
         app
+    }
+
+    fn maybe_refresh_pem(&mut self, apk_path: &str) {
+        if apk_path.is_empty() || apk_path == self.last_pem_path {
+            return;
+        }
+        if !std::path::Path::new(apk_path).exists() {
+            return;
+        }
+        self.last_pem_path = apk_path.to_string();
+        self.pem_key = None;
+        let (tx, rx) = task::channel();
+        self.pem_rx = Some(rx);
+        crate::runner::extract_pem(&self.rt, tx, apk_path.to_string());
     }
 
     fn start_fetch_versions(&mut self, tx: task::Sender) {
@@ -401,6 +423,9 @@ impl App {
                         Style::default().fg(Color::Cyan),
                         format!("Downloaded: {}", p.display()),
                     );
+                    // Extract PEM from the downloaded APK for auto-detection
+                    let path_str = p.to_string_lossy().to_string();
+                    self.maybe_refresh_pem(&path_str);
                 }
                 TaskMsg::PemKeys(keys) => {
                     self.pem_keys = keys;
@@ -426,6 +451,17 @@ impl App {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                         format!("Error: {e}"),
                     );
+                }
+            }
+        }
+
+        // Drain background PEM extraction channel
+        if let Some(pem_rx) = &self.pem_rx {
+            while let Ok(msg) = pem_rx.try_recv() {
+                if let TaskMsg::PemKeys(keys) = msg
+                    && let Some(key) = keys.into_iter().next()
+                {
+                    self.pem_key = Some(key.into_bytes());
                 }
             }
         }
@@ -586,6 +622,7 @@ impl App {
                     path,
                     self.host.trim().to_string(),
                     self.fw_model,
+                    self.pem_key.clone(),
                 );
             }
             ConfirmAction::InstallIscope(path) => {
@@ -599,6 +636,7 @@ impl App {
                     path,
                     self.host.trim().to_string(),
                     self.fw_model,
+                    self.pem_key.clone(),
                 );
             }
             ConfirmAction::DownloadAndInstall {
@@ -619,6 +657,7 @@ impl App {
                     dest,
                     host,
                     self.fw_model,
+                    self.pem_key.clone(),
                 );
             }
         }
@@ -650,7 +689,8 @@ impl App {
             Some(BrowserTarget::Apk) => {
                 let s = path.to_string_lossy().to_string();
                 self.apk_cursor = s.len();
-                self.apk_path = s;
+                self.apk_path = s.clone();
+                self.maybe_refresh_pem(&s);
             }
             Some(BrowserTarget::Iscope) => {
                 let s = path.to_string_lossy().to_string();
@@ -887,10 +927,18 @@ impl App {
             },
             Focus::ModelTabs => match code {
                 KeyCode::Left | KeyCode::Char('h') => {
-                    self.fw_model = crate::firmware::ScopeModel::S50;
+                    self.fw_model = match self.fw_model {
+                        crate::firmware::ScopeModel::Auto => crate::firmware::ScopeModel::S30Pro,
+                        crate::firmware::ScopeModel::S50 => crate::firmware::ScopeModel::Auto,
+                        crate::firmware::ScopeModel::S30Pro => crate::firmware::ScopeModel::S50,
+                    };
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
-                    self.fw_model = crate::firmware::ScopeModel::S30Pro;
+                    self.fw_model = match self.fw_model {
+                        crate::firmware::ScopeModel::Auto => crate::firmware::ScopeModel::S50,
+                        crate::firmware::ScopeModel::S50 => crate::firmware::ScopeModel::S30Pro,
+                        crate::firmware::ScopeModel::S30Pro => crate::firmware::ScopeModel::Auto,
+                    };
                 }
                 KeyCode::Tab => self.focus = Focus::ActionButton,
                 KeyCode::BackTab => self.focus = Focus::Host,
@@ -1183,23 +1231,28 @@ fn draw_firmware(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
     let model_idx = match app.fw_model {
-        crate::firmware::ScopeModel::S50 => 0,
-        crate::firmware::ScopeModel::S30Pro => 1,
+        crate::firmware::ScopeModel::Auto => 0,
+        crate::firmware::ScopeModel::S50 => 1,
+        crate::firmware::ScopeModel::S30Pro => 2,
     };
-    let model_tabs = Tabs::new(vec![Line::from("S50"), Line::from("S30 / S30 Pro")])
-        .select(model_idx)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Model  [←/→ to switch]")
-                .style(model_style),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(model_style);
+    let model_tabs = Tabs::new(vec![
+        Line::from("Auto-detect"),
+        Line::from("S50"),
+        Line::from("S30 / S30 Pro"),
+    ])
+    .select(model_idx)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Model  [←/→ to switch]")
+            .style(model_style),
+    )
+    .highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .style(model_style);
     f.render_widget(model_tabs, chunks[4]);
 
     // ── action button(s) ─────────────────────────────────────────────────────
