@@ -43,13 +43,14 @@ fn find_pem_keys(strings_output: &str) -> Vec<String> {
 }
 
 /// Result of a PEM extraction run.
+#[derive(Debug)]
 pub struct PemResult {
     pub keys: Vec<String>,
 }
 
 /// Extract PEM private keys from an APK/XAPK file.
 /// Searches `libopenssllib.so` in both arm64-v8a and armeabi-v7a.
-pub fn extract_pem_from_apk(apk_path: &str, progress: impl Fn(String)) -> Result<PemResult> {
+pub fn extract_pem_from_apk(apk_path: &str, mut progress: impl FnMut(String)) -> Result<PemResult> {
     let version = crate::apk::apk_version(apk_path);
     progress(format!("APK version: {}", version));
 
@@ -89,6 +90,45 @@ pub fn extract_pem_from_apk(apk_path: &str, progress: impl Fn(String)) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn make_apk(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zw = ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default();
+        for (name, data) in files {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    struct TempFile(std::path::PathBuf);
+    impl TempFile {
+        fn write(name: &str, data: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(name);
+            std::fs::write(&path, data).unwrap();
+            TempFile(path)
+        }
+        fn path_str(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const FAKE_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+                            MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEA\n\
+                            -----END PRIVATE KEY-----";
+
+    const FAKE_KEY_2: &str = "-----BEGIN PRIVATE KEY-----\n\
+                              AAABBBCCC111222333\n\
+                              -----END PRIVATE KEY-----";
 
     // ── extract_strings ───────────────────────────────────────────────────────
 
@@ -152,14 +192,6 @@ mod tests {
 
     // ── find_pem_keys ─────────────────────────────────────────────────────────
 
-    const FAKE_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
-                            MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEA\n\
-                            -----END PRIVATE KEY-----";
-
-    const FAKE_KEY_2: &str = "-----BEGIN PRIVATE KEY-----\n\
-                              AAABBBCCC111222333\n\
-                              -----END PRIVATE KEY-----";
-
     #[test]
     fn find_pem_keys_no_keys() {
         assert!(find_pem_keys("no keys here at all").is_empty());
@@ -205,5 +237,104 @@ mod tests {
         let input = "-----BEGIN RSA PRIVATE KEY-----\ndata\n-----END RSA PRIVATE KEY-----";
         // The regex requires exactly "PRIVATE KEY" not "RSA PRIVATE KEY" between delimiters
         assert!(find_pem_keys(input).is_empty());
+    }
+
+    // ── extract_pem_from_apk ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_pem_from_apk_nonexistent_file_returns_error() {
+        let err = extract_pem_from_apk("/nonexistent/pem_test.apk", |_| {}).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn extract_pem_from_apk_no_so_files_returns_empty_keys() {
+        let apk = make_apk(&[("assets/other.txt", b"nothing here")]);
+        let tmp = TempFile::write("pem_test_no_so.apk", &apk);
+        let result = extract_pem_from_apk(tmp.path_str(), |_| {}).unwrap();
+        assert!(result.keys.is_empty());
+    }
+
+    #[test]
+    fn extract_pem_from_apk_so_with_no_key_returns_empty() {
+        // .so file exists but contains no PEM block
+        let so_data = b"\x7fELF binary data with no key here at all";
+        let apk = make_apk(&[("lib/arm64-v8a/libopenssllib.so", so_data)]);
+        let tmp = TempFile::write("pem_test_no_key.apk", &apk);
+        let result = extract_pem_from_apk(tmp.path_str(), |_| {}).unwrap();
+        assert!(result.keys.is_empty());
+    }
+
+    #[test]
+    fn extract_pem_from_apk_arm64_so_with_key_returns_key() {
+        let mut so_data = vec![0x00u8, 0x01, 0x02]; // binary prefix
+        so_data.extend_from_slice(FAKE_KEY.as_bytes());
+        so_data.push(0x00);
+
+        let apk = make_apk(&[("lib/arm64-v8a/libopenssllib.so", &so_data)]);
+        let tmp = TempFile::write("pem_test_arm64.apk", &apk);
+
+        let mut log = Vec::new();
+        let result = extract_pem_from_apk(tmp.path_str(), |s| log.push(s)).unwrap();
+        assert_eq!(result.keys.len(), 1);
+        assert!(result.keys[0].contains("BEGIN PRIVATE KEY"));
+        assert!(log.iter().any(|l| l.contains("arm64-v8a")));
+    }
+
+    #[test]
+    fn extract_pem_from_apk_armeabi_so_with_key_returns_key() {
+        let mut so_data = vec![0x00u8];
+        so_data.extend_from_slice(FAKE_KEY.as_bytes());
+
+        let apk = make_apk(&[("lib/armeabi-v7a/libopenssllib.so", &so_data)]);
+        let tmp = TempFile::write("pem_test_armeabi.apk", &apk);
+        let result = extract_pem_from_apk(tmp.path_str(), |_| {}).unwrap();
+        assert_eq!(result.keys.len(), 1);
+    }
+
+    #[test]
+    fn extract_pem_from_apk_deduplicates_same_key_across_archs() {
+        // Same key in both arm64 and armeabi → deduplicated to one entry.
+        let mut so_data = vec![0x00u8];
+        so_data.extend_from_slice(FAKE_KEY.as_bytes());
+
+        let apk = make_apk(&[
+            ("lib/arm64-v8a/libopenssllib.so", &so_data),
+            ("lib/armeabi-v7a/libopenssllib.so", &so_data),
+        ]);
+        let tmp = TempFile::write("pem_test_dedup.apk", &apk);
+        let result = extract_pem_from_apk(tmp.path_str(), |_| {}).unwrap();
+        assert_eq!(result.keys.len(), 1);
+    }
+
+    #[test]
+    fn extract_pem_from_apk_distinct_keys_across_archs_returns_both() {
+        let mut so64 = vec![0x00u8];
+        so64.extend_from_slice(FAKE_KEY.as_bytes());
+
+        let mut so32 = vec![0x00u8];
+        so32.extend_from_slice(FAKE_KEY_2.as_bytes());
+
+        let apk = make_apk(&[
+            ("lib/arm64-v8a/libopenssllib.so", &so64),
+            ("lib/armeabi-v7a/libopenssllib.so", &so32),
+        ]);
+        let tmp = TempFile::write("pem_test_two_keys.apk", &apk);
+        let result = extract_pem_from_apk(tmp.path_str(), |_| {}).unwrap();
+        assert_eq!(result.keys.len(), 2);
+    }
+
+    #[test]
+    fn extract_pem_from_apk_logs_version_and_scan_progress() {
+        let mut so_data = vec![0x00u8];
+        so_data.extend_from_slice(FAKE_KEY.as_bytes());
+        let apk = make_apk(&[("lib/arm64-v8a/libopenssllib.so", &so_data)]);
+        let tmp = TempFile::write("pem_test_log.apk", &apk);
+
+        let mut log = Vec::new();
+        let _ = extract_pem_from_apk(tmp.path_str(), |s| log.push(s));
+        assert!(log.iter().any(|l| l.contains("APK version")));
+        assert!(log.iter().any(|l| l.contains("Scanning")));
+        assert!(log.iter().any(|l| l.contains("Found")));
     }
 }
