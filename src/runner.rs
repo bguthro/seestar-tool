@@ -77,21 +77,38 @@ pub fn download_only(
 
 /// Resolve `ScopeModel::Auto` by connecting to the scope and querying its model.
 /// Returns `Ok(resolved_model)` or `Err` on failure.
+///
+/// `apk_path` is used as a fallback key source when `pem_key` was not pre-extracted
+/// (e.g. when the user clicks install immediately after picking the file).
 fn resolve_model(
     model: ScopeModel,
     host: &str,
     pem_key: Option<&[u8]>,
+    apk_path: Option<&str>,
     tx: &Sender,
 ) -> anyhow::Result<ScopeModel> {
     if !model.is_auto() {
         return Ok(model);
     }
-    let key = pem_key.ok_or_else(|| {
-        anyhow::anyhow!(
+    // If no pre-extracted key, try to extract one from the APK path now.
+    let extracted: Option<Vec<u8>>;
+    let key: &[u8] = if let Some(k) = pem_key {
+        k
+    } else if let Some(path) = apk_path {
+        let _ = tx.send(TaskMsg::Log("Extracting key from APK…".to_string()));
+        let result = crate::pem::extract_pem_from_apk(path, |_| {})?;
+        let pem_str =
+            result.keys.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("No PEM key found in APK. Select a model manually.")
+            })?;
+        extracted = Some(pem_str.into_bytes());
+        extracted.as_deref().unwrap()
+    } else {
+        return Err(anyhow::anyhow!(
             "Auto-detect requires an APK to extract the key from. \
              Load an APK file or select a model manually."
-        )
-    })?;
+        ));
+    };
     let _ = tx.send(TaskMsg::Log("Auto-detecting model…".to_string()));
     match crate::firmware::detect_scope_model(host, key) {
         Ok(m) => {
@@ -141,15 +158,12 @@ pub fn download_and_install(
         let tx_ext = tx.clone();
         let tx_log = tx.clone();
         let tx_up = tx.clone();
+        let path_str = path.to_string_lossy().into_owned();
         let result = tokio::task::spawn_blocking(move || {
-            let model = resolve_model(model, &host, pem_key.as_deref(), &tx_log)?;
-            let iscope = crate::firmware::extract_iscope(
-                path.to_str().unwrap_or_default(),
-                model,
-                move |s| {
-                    let _ = tx_ext.send(TaskMsg::Log(s));
-                },
-            )?;
+            let model = resolve_model(model, &host, pem_key.as_deref(), Some(&path_str), &tx_log)?;
+            let iscope = crate::firmware::extract_iscope(&path_str, model, move |s| {
+                let _ = tx_ext.send(TaskMsg::Log(s));
+            })?;
             let log = move |s: String| {
                 let _ = tx_log.send(TaskMsg::Log(s));
             };
@@ -191,7 +205,7 @@ pub fn install_apk(
         let tx_log = tx.clone();
         let tx_up = tx.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let model = resolve_model(model, &host, pem_key.as_deref(), &tx_log)?;
+            let model = resolve_model(model, &host, pem_key.as_deref(), Some(&apk_path), &tx_log)?;
             let iscope = crate::firmware::extract_iscope(&apk_path, model, move |s| {
                 let _ = tx_ext.send(TaskMsg::Log(s));
             })?;
@@ -236,7 +250,7 @@ pub fn install_iscope(
             } = target;
             let tx_log = tx.clone();
             let tx_up = tx.clone();
-            let model = resolve_model(model, &host, pem_key.as_deref(), &tx_log)?;
+            let model = resolve_model(model, &host, pem_key.as_deref(), None, &tx_log)?;
             let log = move |s: String| {
                 let _ = tx_log.send(TaskMsg::Log(s));
             };
