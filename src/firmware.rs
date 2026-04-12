@@ -415,15 +415,25 @@ fn detect_scope_model_on_port(
     log(format!("<- {}", pi_ack));
     // Non-zero result is non-fatal (seestar_alp also ignores it)
 
-    // get_device_state
+    // get_device_state — skip any async event pushes while waiting for our response
     let state_req = serde_json::json!({"id":4,"method":"get_device_state","params":[]});
     stream.write_all(format!("{}\r\n", state_req).as_bytes())?;
-    let state_resp = recv_line(&mut stream)?;
-    let state_v: serde_json::Value = serde_json::from_str(&state_resp)
-        .map_err(|_| anyhow!("Invalid JSON from scope: {}", state_resp))?;
+    let state_v = loop {
+        let line = recv_line(&mut stream)?;
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|_| anyhow!("Invalid JSON from scope: {}", line))?;
+        if v.get("Event").is_some() {
+            log(format!(
+                "(skipping event: {})",
+                v["Event"].as_str().unwrap_or("?")
+            ));
+            continue;
+        }
+        break v;
+    };
     let product_model = state_v["result"]["device"]["product_model"]
         .as_str()
-        .ok_or_else(|| anyhow!("No product_model in: {}", state_resp))?;
+        .ok_or_else(|| anyhow!("No product_model in: {}", state_v))?;
 
     if product_model.contains("S30") {
         Ok(ScopeModel::S30Pro)
