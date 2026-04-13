@@ -25,6 +25,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rsa = { version = "0.9", features = ["sha1"] }
 sha1 = "0.10"
 base64 = "0.22"
+tar = "0.4"
+bzip2 = "0.4"
 
 [lints.rust]
 dead_code = "deny"
