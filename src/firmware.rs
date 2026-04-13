@@ -528,7 +528,7 @@ fn detect_scope_model_on_port(
     // model would flash the wrong firmware variant and could brick the scope.
     if product_model.contains("S30") {
         Ok(ScopeModel::S30Pro)
-    } else if product_model.contains("S50") || product_model.contains("SE50") {
+    } else if product_model.contains("S50") {
         Ok(ScopeModel::S50)
     } else {
         Err(anyhow!(
