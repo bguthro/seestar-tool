@@ -486,15 +486,20 @@ pub(crate) fn wait_for_scope(
     }
 
     // Phase 2: indeterminate bar while scope reboots and comes back online.
+    // Try to actually connect and read greeting to ensure scope is fully ready.
     loop {
         if Instant::now() >= deadline {
             return Err(anyhow!("Timed out waiting for scope to come back online"));
         }
-        if can_connect(address, port) {
-            let elapsed = t0.elapsed().as_secs();
-            progress(format!("Scope is back online! ({elapsed}s)"));
-            install_progress(0, 0);
-            return Ok(());
+        // Try to connect and read greeting message (scope is ready once it sends this).
+        if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", address, port)) {
+            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+            if recv_line(&mut stream).is_ok() {
+                let elapsed = t0.elapsed().as_secs();
+                progress(format!("Scope is back online! ({elapsed}s)"));
+                install_progress(0, 0);
+                return Ok(());
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1146,6 +1151,9 @@ mod tests {
                 // Scope comes back on the same port.
                 std::thread::sleep(Duration::from_millis(20));
                 let new_l = TcpListener::bind(format!("127.0.0.1:{}", cmd_port)).unwrap();
+                if let Ok((mut c, _)) = new_l.accept() {
+                    c.write_all(b"{\"status\":\"ready\"}\r\n").unwrap();
+                }
                 std::thread::sleep(Duration::from_millis(5000));
                 drop(new_l);
             }
@@ -1193,6 +1201,9 @@ mod tests {
                 drop(cmd_listener);
                 std::thread::sleep(Duration::from_millis(20));
                 let new_l = TcpListener::bind(format!("127.0.0.1:{}", cmd_port)).unwrap();
+                if let Ok((mut c, _)) = new_l.accept() {
+                    c.write_all(b"{\"name\":\"seestar-s50\"}\r\n").unwrap();
+                }
                 std::thread::sleep(Duration::from_millis(5000));
                 drop(new_l);
             }
@@ -1593,8 +1604,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             drop(listener); // go offline
             std::thread::sleep(Duration::from_millis(150));
-            // come back
+            // come back and send greeting when connected
             let new_l = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+            if let Ok((mut c, _)) = new_l.accept() {
+                c.write_all(b"{\"status\":\"ready\"}\r\n").unwrap();
+            }
             std::thread::sleep(Duration::from_millis(1000));
             drop(new_l);
         });
