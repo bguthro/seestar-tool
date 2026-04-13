@@ -50,6 +50,56 @@ async fn api_get(url: &str) -> Result<Vec<u8>> {
     Ok(resp.bytes().await?.to_vec())
 }
 
+// ── download validation ───────────────────────────────────────────────────────
+
+/// Minimum acceptable size for a downloaded XAPK/APK.
+const XAPK_MIN_BYTES: u64 = 1024 * 1024; // 1 MB
+
+/// Validate that a downloaded file is a complete, well-formed ZIP/XAPK.
+///
+/// Checks:
+/// - File size is above a minimum threshold (guards against truncated downloads)
+/// - File starts with ZIP magic bytes `PK\x03\x04`
+/// - File can be opened as a ZIP archive (central directory is intact)
+pub fn validate_download(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let size = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("Cannot stat downloaded file: {}", e))?
+        .len();
+
+    if size < XAPK_MIN_BYTES {
+        return Err(anyhow::anyhow!(
+            "Downloaded file is too small ({} bytes; minimum {}). \
+             The download may be incomplete or corrupted.",
+            size,
+            XAPK_MIN_BYTES
+        ));
+    }
+
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)?.read_exact(&mut magic)?;
+    if &magic != b"PK\x03\x04" {
+        return Err(anyhow::anyhow!(
+            "Downloaded file is not a valid ZIP/XAPK \
+             (expected PK magic bytes, got {:02X?}). \
+             The download is corrupted.",
+            magic
+        ));
+    }
+
+    let f = std::fs::File::open(path)?;
+    zip::ZipArchive::new(f).map_err(|e| {
+        anyhow::anyhow!(
+            "Downloaded file failed ZIP integrity check: {}. \
+             The download is corrupted.",
+            e
+        )
+    })?;
+
+    Ok(())
+}
+
 // ── download ──────────────────────────────────────────────────────────────────
 
 /// Download a specific XAPK into `dest_dir`.

@@ -59,6 +59,63 @@ impl ScopeModel {
     }
 }
 
+// ── iscope validation ─────────────────────────────────────────────────────────
+
+/// Minimum acceptable size for an iscope firmware binary.
+const ISCOPE_MIN_BYTES: usize = 256 * 1024; // 256 KB
+
+/// Validate that `data` is a plausible iscope binary for `model`.
+///
+/// Checks:
+/// - Minimum file size (guards against truncated or empty files)
+/// - ELF magic bytes `\x7fELF`
+/// - ELF class (byte 4): 1 = 32-bit for S50, 2 = 64-bit for S30 Pro
+///
+/// Returns `Err` with a human-readable message on any mismatch.
+pub fn validate_iscope_data(data: &[u8], model: ScopeModel) -> Result<()> {
+    if data.len() < ISCOPE_MIN_BYTES {
+        return Err(anyhow!(
+            "Firmware file is too small ({} bytes; minimum {}). \
+             The file is likely corrupted or incomplete.",
+            data.len(),
+            ISCOPE_MIN_BYTES
+        ));
+    }
+    if data.len() < 5 || &data[..4] != b"\x7fELF" {
+        return Err(anyhow!(
+            "Firmware file does not have a valid ELF header. \
+             The file is likely corrupted or is not a Seestar firmware binary."
+        ));
+    }
+    let elf_class = data[4]; // 1 = 32-bit, 2 = 64-bit
+    match model {
+        ScopeModel::S50 => {
+            if elf_class != 1 {
+                return Err(anyhow!(
+                    "Firmware is a 64-bit binary, but the S50 requires a 32-bit binary. \
+                     This would brick the scope — aborting. \
+                     Check that the correct model is selected."
+                ));
+            }
+        }
+        ScopeModel::S30Pro => {
+            if elf_class != 2 {
+                return Err(anyhow!(
+                    "Firmware is a 32-bit binary, but the S30 / S30 Pro requires a 64-bit binary. \
+                     This would brick the scope — aborting. \
+                     Check that the correct model is selected."
+                ));
+            }
+        }
+        ScopeModel::Auto => {
+            return Err(anyhow!(
+                "BUG: model must be resolved before validating firmware."
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── iscope extraction ─────────────────────────────────────────────────────────
 
 /// Extract the firmware binary for `model` from an APK or XAPK file.
@@ -81,6 +138,9 @@ pub fn extract_iscope(
         .read(asset)
         .map_err(|_| anyhow!("{} not found in APK", asset))?;
     progress(format!("Extracted {} ({} MB)", asset, data.len() >> 20));
+
+    validate_iscope_data(&data, model)?;
+    progress(format!("Validated {} (ELF OK, size OK)", asset));
     Ok(data)
 }
 
@@ -142,6 +202,16 @@ fn upload_firmware_inner(
         data_port,
         wait_timeout,
     } = ports;
+
+    // Safety: only known firmware filenames are accepted.
+    const ALLOWED_FILENAMES: &[&str] = &["iscope", "iscope_64"];
+    if !ALLOWED_FILENAMES.contains(&remote_filename) {
+        return Err(anyhow!(
+            "Unexpected firmware filename '{}'. Only 'iscope' and 'iscope_64' are accepted. Aborting for safety.",
+            remote_filename
+        ));
+    }
+
     let file_len = iscope_data.len();
     let fmd5 = format!("{:x}", md5::compute(iscope_data));
 
@@ -180,10 +250,26 @@ fn upload_firmware_inner(
 
     // Read ACK.
     let ack = recv_line(&mut s_cmd)?;
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack)
-        && !v["error"].is_null()
-    {
-        return Err(anyhow!("Scope error: {}", v["error"]));
+    match serde_json::from_str::<serde_json::Value>(&ack) {
+        Ok(v) => {
+            if !v["error"].is_null() {
+                return Err(anyhow!("Scope rejected firmware upload: {}", v["error"]));
+            }
+            let code = v["code"].as_i64().unwrap_or(0);
+            if code != 0 {
+                return Err(anyhow!(
+                    "Scope rejected firmware upload (code {}): {}",
+                    code,
+                    ack
+                ));
+            }
+        }
+        Err(_) => {
+            return Err(anyhow!(
+                "Invalid response from scope during upload handshake: {}",
+                ack
+            ));
+        }
     }
 
     // Stream firmware on data socket.
@@ -214,6 +300,7 @@ pub fn upload_firmware_file(
     upload_progress: impl Fn(u64, u64) + Send + 'static,
 ) -> Result<()> {
     let data = std::fs::read(path)?;
+    validate_iscope_data(&data, model)?;
     upload_firmware(
         address,
         &data,
@@ -435,10 +522,21 @@ fn detect_scope_model_on_port(
         .as_str()
         .ok_or_else(|| anyhow!("No product_model in: {}", state_v))?;
 
+    log(format!("product_model: {}", product_model));
+
+    // Be strict: only accept known model strings. Defaulting on an unrecognised
+    // model would flash the wrong firmware variant and could brick the scope.
     if product_model.contains("S30") {
         Ok(ScopeModel::S30Pro)
-    } else {
+    } else if product_model.contains("S50") || product_model.contains("SE50") {
         Ok(ScopeModel::S50)
+    } else {
+        Err(anyhow!(
+            "Unrecognized product_model '{}'. \
+             Cannot safely determine the firmware variant — aborting. \
+             Select your model manually (S50 or S30 / S30 Pro).",
+            product_model
+        ))
     }
 }
 
@@ -459,6 +557,16 @@ mod tests {
             conn.write_all(data).unwrap();
         });
         addr
+    }
+
+    /// Build a minimal fake ELF binary of the given class (1=32-bit, 2=64-bit),
+    /// padded to exceed ISCOPE_MIN_BYTES so validation passes.
+    fn make_fake_elf(elf_class: u8) -> Vec<u8> {
+        let mut data = vec![0u8; ISCOPE_MIN_BYTES + 16];
+        data[0..4].copy_from_slice(b"\x7fELF");
+        data[4] = elf_class; // EI_CLASS: 1=32-bit, 2=64-bit
+        data[5] = 1; // EI_DATA: little-endian
+        data
     }
 
     /// Build an in-memory APK ZIP containing `files` (path → bytes).
@@ -493,6 +601,69 @@ mod tests {
     }
 
     // ── ScopeModel ────────────────────────────────────────────────────────────
+
+    // ── validate_iscope_data ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_iscope_rejects_empty_data() {
+        let err = validate_iscope_data(&[], ScopeModel::S50).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn validate_iscope_rejects_truncated_data() {
+        let err = validate_iscope_data(&[0u8; 100], ScopeModel::S50).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn validate_iscope_rejects_bad_elf_magic() {
+        let mut data = vec![0u8; ISCOPE_MIN_BYTES + 16];
+        data[0..4].copy_from_slice(b"NELF");
+        let err = validate_iscope_data(&data, ScopeModel::S50).unwrap_err();
+        assert!(err.to_string().contains("ELF"));
+    }
+
+    #[test]
+    fn validate_iscope_rejects_64bit_for_s50() {
+        let data = make_fake_elf(2); // 64-bit
+        let err = validate_iscope_data(&data, ScopeModel::S50).unwrap_err();
+        assert!(err.to_string().contains("64-bit"));
+    }
+
+    #[test]
+    fn validate_iscope_rejects_32bit_for_s30pro() {
+        let data = make_fake_elf(1); // 32-bit
+        let err = validate_iscope_data(&data, ScopeModel::S30Pro).unwrap_err();
+        assert!(err.to_string().contains("32-bit"));
+    }
+
+    #[test]
+    fn validate_iscope_accepts_32bit_for_s50() {
+        let data = make_fake_elf(1);
+        validate_iscope_data(&data, ScopeModel::S50).unwrap();
+    }
+
+    #[test]
+    fn validate_iscope_accepts_64bit_for_s30pro() {
+        let data = make_fake_elf(2);
+        validate_iscope_data(&data, ScopeModel::S30Pro).unwrap();
+    }
+
+    #[test]
+    fn detect_scope_model_unknown_product_model_returns_error() {
+        // A product_model that contains neither S50 nor S30 should be rejected.
+        let addr = serve_api_once("Seestar X99", 0);
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("Unrecognized"),
+            "expected unrecognized-model error, got: {}",
+            err
+        );
+    }
+
+    // ── scope_model ───────────────────────────────────────────────────────────
 
     #[test]
     fn scope_model_default_is_auto() {
@@ -537,8 +708,12 @@ mod tests {
 
     #[test]
     fn extract_iscope_s50_from_plain_apk() {
-        let firmware = b"fake-iscope-firmware";
-        let apk = make_apk(&[("assets/iscope", firmware), ("assets/iscope_64", b"64bit")]);
+        let firmware = make_fake_elf(1); // 32-bit for S50
+        let firmware_64 = make_fake_elf(2);
+        let apk = make_apk(&[
+            ("assets/iscope", &firmware),
+            ("assets/iscope_64", &firmware_64),
+        ]);
         let tmp = TempFile::write("fw_test_s50.apk", &apk);
         let mut logged_asset = String::new();
         let data = extract_iscope(tmp.path_str(), ScopeModel::S50, |s| {
@@ -553,8 +728,12 @@ mod tests {
 
     #[test]
     fn extract_iscope_s30pro_from_plain_apk() {
-        let firmware = b"fake-iscope64-firmware";
-        let apk = make_apk(&[("assets/iscope", b"32bit"), ("assets/iscope_64", firmware)]);
+        let firmware = make_fake_elf(2); // 64-bit for S30 Pro
+        let firmware_32 = make_fake_elf(1);
+        let apk = make_apk(&[
+            ("assets/iscope", &firmware_32),
+            ("assets/iscope_64", &firmware),
+        ]);
         let tmp = TempFile::write("fw_test_s30pro.apk", &apk);
         let data = extract_iscope(tmp.path_str(), ScopeModel::S30Pro, |_| {}).unwrap();
         assert_eq!(data, firmware);
@@ -580,8 +759,8 @@ mod tests {
         use std::io::Cursor;
         use zip::write::{SimpleFileOptions, ZipWriter};
 
-        let firmware = b"xapk-firmware";
-        let inner_apk = make_apk(&[("assets/iscope", firmware)]);
+        let firmware = make_fake_elf(1); // 32-bit for S50
+        let inner_apk = make_apk(&[("assets/iscope", &firmware)]);
 
         let mut zw = ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default();
@@ -620,8 +799,9 @@ mod tests {
 
     #[test]
     fn upload_firmware_file_bad_address_returns_error() {
-        // File exists but scope address is unreachable.
-        let tmp = TempFile::write("fw_test_iscope_file", b"firmware bytes");
+        // File exists and is valid, but scope address is unreachable.
+        let elf = make_fake_elf(2); // 64-bit for S30Pro
+        let tmp = TempFile::write("fw_test_iscope_file", &elf);
         let err = upload_firmware_file("127.0.0.1", &tmp.0, ScopeModel::S30Pro, |_| {}, |_, _| {})
             .unwrap_err();
         assert!(err.to_string().contains("Cannot connect"));
@@ -711,7 +891,6 @@ mod tests {
             |_, _| {},
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Scope error"));
         assert!(err.to_string().contains("bad md5"));
     }
 

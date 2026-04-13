@@ -65,6 +65,10 @@ pub fn download_only(
         };
         match crate::apkpure::download_version(&version, &download_url, &dest_dir, prog).await {
             Ok(path) => {
+                if let Err(e) = crate::apkpure::validate_download(&path) {
+                    let _ = tx.send(TaskMsg::Error(e.to_string()));
+                    return;
+                }
                 let _ = tx.send(TaskMsg::Downloaded(path));
                 let _ = tx.send(TaskMsg::Done);
             }
@@ -149,6 +153,10 @@ pub fn download_and_install(
                 return;
             }
         };
+        if let Err(e) = crate::apkpure::validate_download(&path) {
+            let _ = tx.send(TaskMsg::Error(e.to_string()));
+            return;
+        }
         let _ = tx.send(TaskMsg::Downloaded(path.clone()));
         let _ = tx.send(TaskMsg::Progress(0, 0));
 
