@@ -498,11 +498,10 @@ impl App {
         if !self.fw_model.is_auto() {
             return false;
         }
-        // If we have a pre-extracted key, do early detection.
-        let Some(key) = self.pem_key.clone() else {
-            // No pre-extracted key. If APK path is available, skip early detection
-            // and let the runner extract the key synchronously during the action.
-            // If no APK path either, error out.
+        // Try to get the pem_key, extracting from APK if needed.
+        let key = if let Some(k) = self.pem_key.clone() {
+            k
+        } else {
             let apk_path = self.apk_path.trim();
             if apk_path.is_empty() {
                 self.push_log(
@@ -513,8 +512,27 @@ impl App {
                 );
                 return true;
             }
-            // APK path is available; let the runner handle extraction
-            return false;
+            // Extract PEM from APK synchronously (blocking)
+            match crate::pem::extract_pem_from_apk(apk_path, |_| {}) {
+                Ok(result) => {
+                    if let Some(k) = result.keys.into_iter().next() {
+                        k.into_bytes()
+                    } else {
+                        self.push_log(
+                            Style::default().fg(Color::Red),
+                            "No PEM key found in APK. Select a model manually.".to_string(),
+                        );
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    self.push_log(
+                        Style::default().fg(Color::Red),
+                        format!("Failed to extract PEM from APK: {}", e),
+                    );
+                    return true;
+                }
+            }
         };
         let (tx, rx) = task::channel();
         self.rx = rx;
@@ -2037,14 +2055,40 @@ mod tests {
     #[test]
     fn run_action_apk_auto_model_no_pem_logs_error_no_confirm() {
         let mut app = make_app();
-        // Auto model, APK path, but no pem_key → runner will extract key from APK
-        app.apk_path = "/some/file.apk".to_string();
+        // Auto model, no pem_key, no APK path set
+        // run_action should error about missing APK path
 
         app.run_action();
 
-        // Should proceed to action (not error) since APK path is available
-        // for fallback extraction by the runner
-        assert!(app.confirm.is_some(), "action should proceed with APK path");
+        assert!(
+            app.confirm.is_none(),
+            "confirm should not appear when no apk path"
+        );
+        assert!(!app.busy);
+        let has_error = app
+            .logs
+            .iter()
+            .any(|(_, msg)| msg.contains("No APK path entered"));
+        assert!(has_error);
+    }
+
+    #[test]
+    fn run_action_apk_auto_model_with_apk_and_no_pem_starts_detection() {
+        let mut app = make_app();
+        // Auto model, APK path set, but no pem_key yet
+        // maybe_start_detection should extract PEM from APK synchronously
+        // and then start model detection
+        app.apk_path = "/some/file.apk".to_string();
+        app.fw_model = crate::firmware::ScopeModel::default(); // Auto
+
+        // This will try to extract PEM from the fake path and fail,
+        // so it should log an error about extraction failure
+        app.run_action();
+
+        // Since detection start will fail (invalid APK), confirm should not be set
+        assert!(app.confirm.is_none());
+        let has_error = app.logs.iter().any(|(_, msg)| msg.contains("extract PEM"));
+        assert!(has_error);
     }
 
     #[test]
