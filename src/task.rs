@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::apkpure::ApkVersion;
+use crate::firmware::ScopeModel;
 
 #[derive(Debug, Clone)]
 pub enum TaskMsg {
@@ -12,6 +13,8 @@ pub enum TaskMsg {
     VersionList(Vec<ApkVersion>),
     Downloaded(PathBuf),
     PemKeys(Vec<String>),
+    /// Auto-detection resolved to this model — UI should confirm before flashing.
+    ModelDetected(ScopeModel),
     Done,
     Error(String),
 }

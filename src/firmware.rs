@@ -60,6 +60,16 @@ impl ScopeModel {
             ScopeModel::S30Pro => "S30 Pro",
         }
     }
+
+    /// Human-readable description of the firmware variant this model requires.
+    /// Panics if called on `Auto`.
+    pub fn bitness_description(self) -> &'static str {
+        match self {
+            ScopeModel::S50 | ScopeModel::S30 => "32-bit ARM (iscope)",
+            ScopeModel::S30Pro => "64-bit ARM (iscope_64)",
+            ScopeModel::Auto => panic!("ScopeModel::Auto must be resolved before use"),
+        }
+    }
 }
 
 // ── iscope validation ─────────────────────────────────────────────────────────

@@ -229,6 +229,11 @@ struct FirmwareTab {
     downloaded_apk: Option<PathBuf>,
     /// Set when user clicks an install button; cleared on confirm or cancel.
     confirm: Option<PendingAction>,
+    /// When model is Auto and install was clicked, the action is held here while
+    /// detection runs.  On `ModelDetected` it moves to `confirm`.
+    detection_pending: Option<PendingAction>,
+    /// The model resolved by auto-detection, shown in the confirm dialog.
+    detected_model: Option<ScopeModel>,
     /// PEM private key bytes extracted from the loaded APK, used for auto-detection.
     pem_key: Option<Vec<u8>>,
     /// Background channel for PEM extraction (separate from install channel).
@@ -259,6 +264,8 @@ impl FirmwareTab {
             rt,
             downloaded_apk: None,
             confirm: None,
+            detection_pending: None,
+            detected_model: None,
             pem_key: None,
             pem_rx: None,
             last_pem_path: String::new(),
@@ -313,10 +320,23 @@ impl FirmwareTab {
                     self.busy = false;
                     self.progress = (0, 0);
                 }
+                TaskMsg::ModelDetected(model) => {
+                    self.log.push(format!(
+                        "Detected: {} — {}",
+                        model.display_name(),
+                        model.bitness_description()
+                    ));
+                    self.detected_model = Some(model);
+                    self.confirm = self.detection_pending.take();
+                    self.busy = false;
+                    self.progress = (0, 0);
+                }
                 TaskMsg::Error(e) => {
                     self.log.push(format!("ERROR: {}", e));
                     self.busy = false;
                     self.progress = (0, 0);
+                    self.detection_pending = None;
+                    self.detected_model = None;
                 }
                 _ => {}
             }
@@ -376,6 +396,37 @@ impl FirmwareTab {
         crate::runner::download_only(&self.rt, tx, version, download_url, dest_dir);
     }
 
+    /// When model is Auto, run detection first; `action` is held until `ModelDetected`.
+    /// Returns `true` if detection was started (caller should not proceed to confirm).
+    fn maybe_start_detection(&mut self, action: PendingAction) -> bool {
+        if !self.model.is_auto() {
+            return false;
+        }
+        let Some(pem_key) = self.pem_key.clone() else {
+            self.log.push(
+                "ERROR: Auto-detect requires an APK to extract the key from. \
+                 Load an APK file or select a model manually."
+                    .to_string(),
+            );
+            return true; // consumed — don't show stale confirm
+        };
+        let (tx, rx) = channel();
+        self.tx = Some(tx.clone());
+        self.rx = Some(rx);
+        self.busy = true;
+        self.log.clear();
+        self.detection_pending = Some(action);
+        self.detected_model = None;
+        crate::runner::detect_model(&self.rt, tx, self.seestar_host.clone(), pem_key);
+        true
+    }
+
+    /// The model to use for the actual install — either the auto-detected model
+    /// (after user confirmation) or the manually selected one.
+    fn resolved_model(&mut self) -> ScopeModel {
+        self.detected_model.take().unwrap_or(self.model)
+    }
+
     fn start_download_and_install(&mut self) {
         let Some((version, download_url)) = self.resolved_version() else {
             return;
@@ -389,6 +440,7 @@ impl FirmwareTab {
         self.log.clear();
         self.downloaded_apk = None;
         self.progress = (0, 0);
+        let model = self.resolved_model();
         crate::runner::download_and_install(
             &self.rt,
             tx,
@@ -397,7 +449,7 @@ impl FirmwareTab {
             dest_dir,
             crate::runner::InstallTarget {
                 host,
-                model: self.model,
+                model,
                 pem_key: self.pem_key.clone(),
             },
         );
@@ -410,13 +462,14 @@ impl FirmwareTab {
         self.busy = true;
         self.log.clear();
         self.progress = (0, 0);
+        let model = self.resolved_model();
         crate::runner::install_apk(
             &self.rt,
             tx,
             self.apk_path.clone(),
             crate::runner::InstallTarget {
                 host: self.seestar_host.clone(),
-                model: self.model,
+                model,
                 pem_key: self.pem_key.clone(),
             },
         );
@@ -429,13 +482,14 @@ impl FirmwareTab {
         self.busy = true;
         self.log.clear();
         self.progress = (0, 0);
+        let model = self.resolved_model();
         crate::runner::install_iscope(
             &self.rt,
             tx,
             self.iscope_path.clone(),
             crate::runner::InstallTarget {
                 host: self.seestar_host.clone(),
-                model: self.model,
+                model,
                 pem_key: self.pem_key.clone(),
             },
         );
@@ -571,21 +625,42 @@ impl eframe::App for SeestarApp {
 
         // Confirmation modal — blocks other interaction
         if let Some(action) = self.fw.confirm {
-            let (title, body) = match action {
-                PendingAction::InstallApk | PendingAction::InstallIscope => (
-                    "Confirm Firmware Update",
-                    "This will upload firmware directly to your Seestar.\n\
+            let title = match action {
+                PendingAction::InstallApk | PendingAction::InstallIscope => {
+                    "Confirm Firmware Update"
+                }
+                PendingAction::DownloadAndInstall => "Confirm Download & Install",
+            };
+
+            // Build the body text.  When auto-detection ran, show model + bitness
+            // and ask the user to verify before anything is flashed.
+            let base = match action {
+                PendingAction::InstallApk | PendingAction::InstallIscope => {
+                    "This will upload firmware directly to your Seestar."
+                }
+                PendingAction::DownloadAndInstall => {
+                    "This will download firmware from APKPure and upload it to your Seestar."
+                }
+            };
+            let body = if let Some(m) = self.fw.detected_model {
+                format!(
+                    "Auto-detected model:  {} — {}\n\n\
+                     Does this match your scope?\n\
+                     If unsure, cancel and select the model manually.\n\n\
+                     {}\n\
                      The scope will reboot during installation.\n\n\
-                     Ensure the scope is fully charged and your network is stable.\n\n\
-                     Continue?",
-                ),
-                PendingAction::DownloadAndInstall => (
-                    "Confirm Download & Install",
-                    "This will download firmware from APKPure and upload it to your Seestar.\n\
+                     Ensure the scope is fully charged and your network is stable.",
+                    m.display_name(),
+                    m.bitness_description(),
+                    base,
+                )
+            } else {
+                format!(
+                    "{}\n\
                      The scope will reboot during installation.\n\n\
-                     Ensure the scope is fully charged and your network is stable.\n\n\
-                     Continue?",
-                ),
+                     Ensure the scope is fully charged and your network is stable.",
+                    base,
+                )
             };
 
             let mut open = true;
@@ -600,7 +675,7 @@ impl eframe::App for SeestarApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(body).color(c_text()));
+                    ui.label(egui::RichText::new(&body).color(c_text()));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.add(primary_btn("Yes, update")).clicked() {
@@ -615,11 +690,13 @@ impl eframe::App for SeestarApp {
                         }
                         ui.add_space(8.0);
                         if ui.add(secondary_btn("Cancel")).clicked() {
+                            self.fw.detected_model = None;
                             self.fw.confirm = None;
                         }
                     });
                 });
             if !open {
+                self.fw.detected_model = None;
                 self.fw.confirm = None;
             }
         }
@@ -823,6 +900,7 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                         if ui
                             .add_enabled(ready, primary_btn("Update Seestar"))
                             .clicked()
+                            && !fw.maybe_start_detection(PendingAction::InstallApk)
                         {
                             fw.confirm = Some(PendingAction::InstallApk);
                         }
@@ -832,6 +910,7 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                         if ui
                             .add_enabled(ready, primary_btn("Update Seestar"))
                             .clicked()
+                            && !fw.maybe_start_detection(PendingAction::InstallIscope)
                         {
                             fw.confirm = Some(PendingAction::InstallIscope);
                         }
@@ -841,6 +920,7 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                         if ui
                             .add_enabled(ready, primary_btn("Download & Install"))
                             .clicked()
+                            && !fw.maybe_start_detection(PendingAction::DownloadAndInstall)
                         {
                             fw.confirm = Some(PendingAction::DownloadAndInstall);
                         }
@@ -862,7 +942,9 @@ fn draw_firmware(ui: &mut egui::Ui, fw: &mut FirmwareTab) {
                         {
                             fw.apk_path = path.to_string_lossy().to_string();
                             fw.source = FirmwareSource::LocalApk;
-                            fw.confirm = Some(PendingAction::InstallApk);
+                            if !fw.maybe_start_detection(PendingAction::InstallApk) {
+                                fw.confirm = Some(PendingAction::InstallApk);
+                            }
                         }
                     }
                 }

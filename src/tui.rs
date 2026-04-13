@@ -330,6 +330,11 @@ struct App {
     // confirmation dialog
     confirm: Option<ConfirmDialog>,
 
+    // auto-detection: action waiting for model detection result
+    detect_pending: Option<ConfirmAction>,
+    // model resolved by auto-detection, kept until confirm is executed
+    detected_model: Option<crate::firmware::ScopeModel>,
+
     quit: bool,
 }
 
@@ -364,6 +369,8 @@ impl App {
             pem_key: None,
             pem_rx: None,
             last_pem_path: String::new(),
+            detect_pending: None,
+            detected_model: None,
         };
         app.start_fetch_versions(tx);
         app
@@ -444,9 +451,27 @@ impl App {
                         "Done.".to_string(),
                     );
                 }
+                TaskMsg::ModelDetected(model) => {
+                    self.busy = false;
+                    self.progress = None;
+                    self.push_log(
+                        Style::default().fg(Color::Cyan),
+                        format!(
+                            "Detected: {} — {}",
+                            model.display_name(),
+                            model.bitness_description()
+                        ),
+                    );
+                    self.detected_model = Some(model);
+                    if let Some(action) = self.detect_pending.take() {
+                        self.confirm = Some(ConfirmDialog::new(action));
+                    }
+                }
                 TaskMsg::Error(e) => {
                     self.busy = false;
                     self.progress = None;
+                    self.detect_pending = None;
+                    self.detected_model = None;
                     self.push_log(
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                         format!("Error: {e}"),
@@ -467,6 +492,29 @@ impl App {
         }
     }
 
+    /// Returns `true` if detection was started (caller should wait for `TaskMsg::ModelDetected`).
+    /// Returns `false` if the model is concrete — caller should proceed with confirm dialog directly.
+    fn maybe_start_detection(&mut self, action: ConfirmAction) -> bool {
+        if !self.fw_model.is_auto() {
+            return false;
+        }
+        let Some(key) = self.pem_key.clone() else {
+            self.push_log(
+                Style::default().fg(Color::Red),
+                "Auto-detect requires an APK to extract the key from. \
+                 Load an APK file or select a model manually."
+                    .to_string(),
+            );
+            return true;
+        };
+        let (tx, rx) = task::channel();
+        self.rx = rx;
+        self.busy = true;
+        self.detect_pending = Some(action);
+        crate::runner::detect_model(&self.rt, tx, self.host.trim().to_string(), key);
+        true
+    }
+
     fn run_action(&mut self) {
         if self.busy {
             return;
@@ -481,7 +529,10 @@ impl App {
                     );
                     return;
                 }
-                self.confirm = Some(ConfirmDialog::new(ConfirmAction::InstallApk(path)));
+                let action = ConfirmAction::InstallApk(path);
+                if !self.maybe_start_detection(action.clone()) {
+                    self.confirm = Some(ConfirmDialog::new(action));
+                }
             }
             FirmwareSource::LocalIscope => {
                 let path = self.iscope_path.trim().to_string();
@@ -492,7 +543,10 @@ impl App {
                     );
                     return;
                 }
-                self.confirm = Some(ConfirmDialog::new(ConfirmAction::InstallIscope(path)));
+                let action = ConfirmAction::InstallIscope(path);
+                if !self.maybe_start_detection(action.clone()) {
+                    self.confirm = Some(ConfirmDialog::new(action));
+                }
             }
             FirmwareSource::Download => {
                 // First pick a directory, then confirm
@@ -583,13 +637,16 @@ impl App {
         };
         let ver = &self.versions[idx];
         if install && !self.host.trim().is_empty() {
-            // Show confirmation before installing
-            self.confirm = Some(ConfirmDialog::new(ConfirmAction::DownloadAndInstall {
+            // Show confirmation before installing (or start detection first if Auto)
+            let action = ConfirmAction::DownloadAndInstall {
                 version: ver.version.clone(),
                 url: ver.download_url.clone(),
                 dest,
                 host: self.host.trim().to_string(),
-            }));
+            };
+            if !self.maybe_start_detection(action.clone()) {
+                self.confirm = Some(ConfirmDialog::new(action));
+            }
         } else {
             // Download-only: start immediately
             let (tx, rx) = task::channel();
@@ -610,6 +667,8 @@ impl App {
         let Some(dlg) = self.confirm.take() else {
             return;
         };
+        // Use detected model if auto-detection ran, otherwise use the selected model.
+        let resolved_model = self.detected_model.take().unwrap_or(self.fw_model);
         match dlg.action {
             ConfirmAction::InstallApk(path) => {
                 let (tx, rx) = task::channel();
@@ -622,7 +681,7 @@ impl App {
                     path,
                     crate::runner::InstallTarget {
                         host: self.host.trim().to_string(),
-                        model: self.fw_model,
+                        model: resolved_model,
                         pem_key: self.pem_key.clone(),
                     },
                 );
@@ -638,7 +697,7 @@ impl App {
                     path,
                     crate::runner::InstallTarget {
                         host: self.host.trim().to_string(),
-                        model: self.fw_model,
+                        model: resolved_model,
                         pem_key: self.pem_key.clone(),
                     },
                 );
@@ -661,7 +720,7 @@ impl App {
                     dest,
                     crate::runner::InstallTarget {
                         host,
-                        model: self.fw_model,
+                        model: resolved_model,
                         pem_key: self.pem_key.clone(),
                     },
                 );
@@ -760,6 +819,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.confirm = None;
+                self.detected_model = None;
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 if let Some(dlg) = self.confirm.as_mut() {
@@ -775,6 +835,7 @@ impl App {
                         ConfirmFocus::Yes => self.execute_confirmed(),
                         ConfirmFocus::No => {
                             self.confirm = None;
+                            self.detected_model = None;
                         }
                     }
                 }
@@ -1461,9 +1522,25 @@ fn draw_confirm_dialog(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    let popup_width = (area.width * 2 / 3).max(50).min(area.width);
-    let body_lines = dlg.body().lines().count() as u16;
-    let popup_height = body_lines + 7; // title + body + spacing + buttons + border
+    // Build full body text, prepending detected model info when available.
+    let full_body: String = if let Some(model) = &app.detected_model {
+        format!(
+            "Auto-detected model:  {} — {}\n\
+             Does this match your scope?\n\
+             If unsure, cancel and select the model manually.\n\
+             \n\
+             {}",
+            model.display_name(),
+            model.bitness_description(),
+            dlg.body()
+        )
+    } else {
+        dlg.body().to_string()
+    };
+
+    let popup_width = (area.width * 2 / 3).max(60).min(area.width);
+    let body_line_count = full_body.lines().count() as u16;
+    let popup_height = body_line_count + 7; // title + body + spacing + buttons + border
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -1490,15 +1567,20 @@ fn draw_confirm_dialog(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         ])
         .split(inner);
 
-    // Body
-    let body_lines: Vec<Line> = dlg
-        .body()
+    // Body — highlight the detected model line in cyan when present
+    let body_lines: Vec<Line> = full_body
         .lines()
-        .map(|l| {
-            Line::from(Span::styled(
-                l.to_string(),
-                Style::default().fg(Color::White),
-            ))
+        .enumerate()
+        .map(|(i, l)| {
+            // First line is the detected-model line when auto-detection ran
+            let style = if app.detected_model.is_some() && i == 0 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(l.to_string(), style))
         })
         .collect();
     f.render_widget(Paragraph::new(body_lines), inner_chunks[0]);
@@ -1803,5 +1885,383 @@ pub fn run(rt: Arc<tokio::runtime::Runtime>) -> anyhow::Result<()> {
 mod dirs_next {
     pub fn download_dir() -> Option<std::path::PathBuf> {
         dirs::download_dir()
+    }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Build an App for state-machine tests.
+    /// The version-fetch task spawned by `new()` will fail silently — that's fine.
+    fn make_app() -> App {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        App::new(rt)
+    }
+
+    // ── maybe_start_detection ────────────────────────────────────────────────
+
+    #[test]
+    fn detection_skipped_when_model_is_not_auto() {
+        let mut app = make_app();
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.apk_path = "/some/file.apk".to_string();
+
+        let started =
+            app.maybe_start_detection(ConfirmAction::InstallApk("/some/file.apk".to_string()));
+
+        assert!(!started, "should return false for concrete model");
+        assert!(!app.busy);
+        assert!(app.detect_pending.is_none());
+    }
+
+    #[test]
+    fn detection_errors_when_auto_but_no_pem_key() {
+        let mut app = make_app();
+        // fw_model is Auto by default; no pem_key
+        assert!(app.pem_key.is_none());
+
+        let started =
+            app.maybe_start_detection(ConfirmAction::InstallApk("/some/file.apk".to_string()));
+
+        assert!(started, "should return true (intercepted) even on error");
+        assert!(!app.busy, "should NOT mark busy — task was not started");
+        assert!(
+            app.detect_pending.is_none(),
+            "pending should not be stored when key is missing"
+        );
+        // An error should have been logged
+        let has_error = app
+            .logs
+            .iter()
+            .any(|(_, msg)| msg.contains("Auto-detect requires"));
+        assert!(has_error, "expected error message in logs");
+    }
+
+    #[test]
+    fn detection_starts_when_auto_with_pem_key() {
+        let mut app = make_app();
+        // fw_model is Auto by default
+        app.pem_key = Some(b"fake-key-bytes".to_vec());
+        app.host = "192.0.2.1".to_string(); // non-routable, task will fail but that's fine
+
+        let action = ConfirmAction::InstallApk("/some/file.apk".to_string());
+        let started = app.maybe_start_detection(action.clone());
+
+        assert!(started, "should return true when detection is started");
+        assert!(app.busy, "should mark busy");
+        assert!(app.detect_pending.is_some(), "should store pending action");
+        assert!(
+            app.confirm.is_none(),
+            "confirm dialog should NOT be shown yet"
+        );
+    }
+
+    // ── run_action ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_action_apk_empty_path_logs_error() {
+        let mut app = make_app();
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.apk_path = "   ".to_string(); // whitespace only
+
+        app.run_action();
+
+        assert!(app.confirm.is_none());
+        let has_error = app.logs.iter().any(|(_, msg)| msg.contains("No APK path"));
+        assert!(has_error);
+    }
+
+    #[test]
+    fn run_action_apk_concrete_model_shows_confirm_immediately() {
+        let mut app = make_app();
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.apk_path = "/some/file.apk".to_string();
+
+        app.run_action();
+
+        assert!(
+            app.confirm.is_some(),
+            "confirm dialog should appear for concrete model"
+        );
+        assert!(!app.busy);
+        assert!(app.detect_pending.is_none());
+    }
+
+    #[test]
+    fn run_action_apk_auto_model_no_pem_logs_error_no_confirm() {
+        let mut app = make_app();
+        // Auto model, no pem_key
+        app.apk_path = "/some/file.apk".to_string();
+
+        app.run_action();
+
+        assert!(
+            app.confirm.is_none(),
+            "confirm should not appear when pem is missing"
+        );
+        assert!(!app.busy);
+        let has_error = app
+            .logs
+            .iter()
+            .any(|(_, msg)| msg.contains("Auto-detect requires"));
+        assert!(has_error);
+    }
+
+    #[test]
+    fn run_action_apk_auto_model_with_pem_starts_detection() {
+        let mut app = make_app();
+        app.pem_key = Some(b"fake-key".to_vec());
+        app.apk_path = "/some/file.apk".to_string();
+        app.host = "192.0.2.1".to_string();
+
+        app.run_action();
+
+        assert!(app.confirm.is_none(), "confirm should not appear yet");
+        assert!(app.busy);
+        assert!(app.detect_pending.is_some());
+    }
+
+    #[test]
+    fn run_action_iscope_empty_path_logs_error() {
+        let mut app = make_app();
+        app.fw_source = FirmwareSource::LocalIscope;
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.iscope_path = String::new();
+
+        app.run_action();
+
+        assert!(app.confirm.is_none());
+        let has_error = app
+            .logs
+            .iter()
+            .any(|(_, msg)| msg.contains("No iscope path"));
+        assert!(has_error);
+    }
+
+    #[test]
+    fn run_action_iscope_concrete_model_shows_confirm_immediately() {
+        let mut app = make_app();
+        app.fw_source = FirmwareSource::LocalIscope;
+        app.fw_model = crate::firmware::ScopeModel::S30Pro;
+        app.iscope_path = "/some/file.iscope_64".to_string();
+
+        app.run_action();
+
+        assert!(app.confirm.is_some());
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn run_action_iscope_auto_model_no_pem_logs_error() {
+        let mut app = make_app();
+        app.fw_source = FirmwareSource::LocalIscope;
+        app.iscope_path = "/some/file.iscope".to_string();
+        // pem_key is None (default)
+
+        app.run_action();
+
+        assert!(app.confirm.is_none());
+        let has_error = app
+            .logs
+            .iter()
+            .any(|(_, msg)| msg.contains("Auto-detect requires"));
+        assert!(has_error);
+    }
+
+    #[test]
+    fn run_action_busy_is_noop() {
+        let mut app = make_app();
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.apk_path = "/some/file.apk".to_string();
+        app.busy = true;
+
+        app.run_action();
+
+        assert!(app.confirm.is_none(), "should not show confirm while busy");
+    }
+
+    // ── execute_confirmed ────────────────────────────────────────────────────
+
+    #[test]
+    fn execute_confirmed_uses_detected_model_and_clears_it() {
+        let mut app = make_app();
+        // Set up an S50 manual selection but provide a detected S30Pro
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.detected_model = Some(crate::firmware::ScopeModel::S30Pro);
+        app.host = "192.0.2.1".to_string(); // non-routable so the task fails fast
+        app.confirm = Some(ConfirmDialog::new(ConfirmAction::InstallApk(
+            "/dev/null".to_string(),
+        )));
+
+        app.execute_confirmed();
+
+        // detected_model consumed
+        assert!(
+            app.detected_model.is_none(),
+            "detected_model should be cleared after use"
+        );
+        // confirm cleared too
+        assert!(app.confirm.is_none());
+        // task was started
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn execute_confirmed_falls_back_to_fw_model_when_no_detected() {
+        let mut app = make_app();
+        app.fw_model = crate::firmware::ScopeModel::S50;
+        app.detected_model = None;
+        app.host = "192.0.2.1".to_string();
+        app.confirm = Some(ConfirmDialog::new(ConfirmAction::InstallApk(
+            "/dev/null".to_string(),
+        )));
+
+        app.execute_confirmed();
+
+        // No panic, task started using fw_model
+        assert!(app.busy);
+        assert!(app.detected_model.is_none());
+    }
+
+    #[test]
+    fn execute_confirmed_is_noop_when_no_confirm() {
+        let mut app = make_app();
+        app.confirm = None;
+
+        app.execute_confirmed(); // should not panic
+
+        assert!(!app.busy);
+    }
+
+    // ── handle_key_confirm ───────────────────────────────────────────────────
+
+    #[test]
+    fn esc_clears_confirm_and_detected_model() {
+        let mut app = make_app();
+        app.confirm = Some(ConfirmDialog::new(ConfirmAction::InstallApk(
+            "/dev/null".to_string(),
+        )));
+        app.detected_model = Some(crate::firmware::ScopeModel::S30Pro);
+
+        app.handle_key_confirm(KeyCode::Esc);
+
+        assert!(app.confirm.is_none());
+        assert!(
+            app.detected_model.is_none(),
+            "detected_model must be cleared on Esc"
+        );
+    }
+
+    #[test]
+    fn cancel_button_clears_confirm_and_detected_model() {
+        let mut app = make_app();
+        let mut dlg = ConfirmDialog::new(ConfirmAction::InstallApk("/dev/null".to_string()));
+        dlg.focus = ConfirmFocus::No; // cursor on Cancel
+        app.confirm = Some(dlg);
+        app.detected_model = Some(crate::firmware::ScopeModel::S50);
+
+        app.handle_key_confirm(KeyCode::Enter);
+
+        assert!(app.confirm.is_none());
+        assert!(
+            app.detected_model.is_none(),
+            "detected_model must be cleared on cancel"
+        );
+    }
+
+    #[test]
+    fn yes_button_consumes_detected_model_via_execute_confirmed() {
+        let mut app = make_app();
+        let mut dlg = ConfirmDialog::new(ConfirmAction::InstallApk("/dev/null".to_string()));
+        dlg.focus = ConfirmFocus::Yes; // cursor on Yes
+        app.confirm = Some(dlg);
+        app.detected_model = Some(crate::firmware::ScopeModel::S30Pro);
+        app.host = "192.0.2.1".to_string();
+
+        app.handle_key_confirm(KeyCode::Enter);
+
+        assert!(
+            app.detected_model.is_none(),
+            "detected_model consumed by execute_confirmed"
+        );
+        assert!(app.busy, "task should have been started");
+    }
+
+    // ── ModelDetected poll handling ──────────────────────────────────────────
+
+    #[test]
+    fn model_detected_msg_opens_confirm_dialog() {
+        let mut app = make_app();
+        app.detect_pending = Some(ConfirmAction::InstallApk("/some/file.apk".to_string()));
+        app.busy = true;
+
+        // Simulate receiving ModelDetected via the channel
+        let (tx, rx) = crate::task::channel();
+        app.rx = rx;
+        tx.send(crate::task::TaskMsg::ModelDetected(
+            crate::firmware::ScopeModel::S30Pro,
+        ))
+        .unwrap();
+
+        app.drain_messages();
+
+        assert!(!app.busy);
+        assert!(app.detected_model.is_some());
+        assert!(
+            app.confirm.is_some(),
+            "confirm dialog should open after detection"
+        );
+        assert!(app.detect_pending.is_none(), "detect_pending consumed");
+    }
+
+    #[test]
+    fn error_msg_clears_detect_pending_and_detected_model() {
+        let mut app = make_app();
+        app.detect_pending = Some(ConfirmAction::InstallApk("/some/file.apk".to_string()));
+        app.detected_model = Some(crate::firmware::ScopeModel::S50);
+        app.busy = true;
+
+        let (tx, rx) = crate::task::channel();
+        app.rx = rx;
+        tx.send(crate::task::TaskMsg::Error(
+            "connection refused".to_string(),
+        ))
+        .unwrap();
+
+        app.drain_messages();
+
+        assert!(!app.busy);
+        assert!(
+            app.detect_pending.is_none(),
+            "detect_pending must be cleared on error"
+        );
+        assert!(
+            app.detected_model.is_none(),
+            "detected_model must be cleared on error"
+        );
+        assert!(app.confirm.is_none(), "confirm must not appear on error");
+    }
+
+    #[test]
+    fn model_detected_without_pending_action_does_not_open_confirm() {
+        let mut app = make_app();
+        // No detect_pending — e.g. user cancelled before response arrived
+        app.detect_pending = None;
+
+        let (tx, rx) = crate::task::channel();
+        app.rx = rx;
+        tx.send(crate::task::TaskMsg::ModelDetected(
+            crate::firmware::ScopeModel::S50,
+        ))
+        .unwrap();
+
+        app.drain_messages();
+
+        assert!(app.detected_model.is_some(), "model is still stored");
+        assert!(app.confirm.is_none(), "no confirm without a pending action");
     }
 }

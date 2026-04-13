@@ -17,6 +17,34 @@ pub struct InstallTarget {
     pub pem_key: Option<Vec<u8>>,
 }
 
+/// Detect the scope model via authenticated API and send `TaskMsg::ModelDetected`.
+///
+/// Sends `TaskMsg::ModelDetected(model)` on success so the UI can show the
+/// result to the user for confirmation before any firmware is flashed.
+/// Sends `TaskMsg::Error` on failure.
+pub fn detect_model(rt: &Arc<tokio::runtime::Runtime>, tx: Sender, host: String, pem_key: Vec<u8>) {
+    rt.spawn(async move {
+        let tx_log = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::firmware::detect_scope_model(&host, &pem_key, move |s| {
+                let _ = tx_log.send(TaskMsg::Log(s));
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(model)) => {
+                let _ = tx.send(TaskMsg::ModelDetected(model));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(TaskMsg::Error(e.to_string()));
+            }
+            Err(e) => {
+                let _ = tx.send(TaskMsg::Error(e.to_string()));
+            }
+        }
+    });
+}
+
 /// Fetch the Seestar version list from APKPure.
 /// Sends `TaskMsg::VersionList` on success, `TaskMsg::Error` on failure.
 pub fn fetch_versions(rt: &Arc<tokio::runtime::Runtime>, tx: Sender) {
