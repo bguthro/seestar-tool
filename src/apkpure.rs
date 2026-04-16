@@ -55,13 +55,19 @@ async fn api_get(url: &str) -> Result<Vec<u8>> {
 /// Quick DNS check to api.pureapk.com to fail fast if unreachable.
 /// Returns `Err` immediately if network is down or domain is unresolvable.
 async fn probe_dns() -> Result<()> {
-    use std::net::ToSocketAddrs;
-    "api.pureapk.com:443"
-        .to_socket_addrs()
-        .map_err(|e| anyhow!("DNS lookup failed (offline?): {}", e))?
-        .next()
-        .ok_or_else(|| anyhow!("DNS lookup returned no addresses"))?;
-    Ok(())
+    use std::time::Duration;
+    use tokio::net::lookup_host;
+
+    // Use async DNS lookup with a short timeout. If network is down, this
+    // will fail almost immediately rather than hanging.
+    match tokio::time::timeout(Duration::from_secs(2), lookup_host("api.pureapk.com:443")).await {
+        Ok(Ok(mut addrs)) => addrs
+            .next()
+            .ok_or_else(|| anyhow!("DNS lookup returned no addresses"))
+            .map(|_| ()),
+        Ok(Err(e)) => Err(anyhow!("DNS lookup failed (offline?): {}", e)),
+        Err(_) => Err(anyhow!("DNS lookup timed out (likely offline)")),
+    }
 }
 
 // ── download validation ───────────────────────────────────────────────────────
