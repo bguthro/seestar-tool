@@ -43,11 +43,25 @@ pub async fn fetch_latest(progress: impl Fn(String)) -> Result<ApkVersion> {
 }
 
 async fn api_get(url: &str) -> Result<Vec<u8>> {
-    let resp = android_client()?.get(url).send().await?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("APKPure API returned HTTP {}", resp.status()));
+    use std::time::Duration;
+
+    // Wrap entire request in explicit timeout to ensure we fail fast offline.
+    // Even with client-level timeouts, the connection attempt or DNS can
+    // sometimes hang on certain systems when offline.
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let resp = android_client()?.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("APKPure API returned HTTP {}", resp.status()));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow!("APKPure request timed out (likely offline)")),
     }
-    Ok(resp.bytes().await?.to_vec())
 }
 
 // ── download validation ───────────────────────────────────────────────────────
