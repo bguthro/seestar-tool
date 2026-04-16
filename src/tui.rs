@@ -975,11 +975,9 @@ impl App {
                         s.insert(*cur, c);
                         *cur += 1;
                     }
-                    KeyCode::Backspace => {
-                        if *cur > 0 {
-                            *cur -= 1;
-                            s.remove(*cur);
-                        }
+                    KeyCode::Backspace if *cur > 0 => {
+                        *cur -= 1;
+                        s.remove(*cur);
                     }
                     KeyCode::Left => *cur = cur.saturating_sub(1),
                     KeyCode::Right => {
@@ -1009,17 +1007,13 @@ impl App {
                     self.host.insert(self.host_cursor, c);
                     self.host_cursor += 1;
                 }
-                KeyCode::Backspace => {
-                    if self.host_cursor > 0 {
-                        self.host_cursor -= 1;
-                        self.host.remove(self.host_cursor);
-                    }
+                KeyCode::Backspace if self.host_cursor > 0 => {
+                    self.host_cursor -= 1;
+                    self.host.remove(self.host_cursor);
                 }
                 KeyCode::Left => self.host_cursor = self.host_cursor.saturating_sub(1),
-                KeyCode::Right => {
-                    if self.host_cursor < self.host.len() {
-                        self.host_cursor += 1;
-                    }
+                KeyCode::Right if self.host_cursor < self.host.len() => {
+                    self.host_cursor += 1;
                 }
                 KeyCode::Tab => self.focus = Focus::ModelTabs,
                 _ => {}
@@ -1097,17 +1091,13 @@ impl App {
                         self.pem_path.insert(self.pem_cursor, c);
                         self.pem_cursor += 1;
                     }
-                    KeyCode::Backspace => {
-                        if self.pem_cursor > 0 {
-                            self.pem_cursor -= 1;
-                            self.pem_path.remove(self.pem_cursor);
-                        }
+                    KeyCode::Backspace if self.pem_cursor > 0 => {
+                        self.pem_cursor -= 1;
+                        self.pem_path.remove(self.pem_cursor);
                     }
                     KeyCode::Left => self.pem_cursor = self.pem_cursor.saturating_sub(1),
-                    KeyCode::Right => {
-                        if self.pem_cursor < self.pem_path.len() {
-                            self.pem_cursor += 1;
-                        }
+                    KeyCode::Right if self.pem_cursor < self.pem_path.len() => {
+                        self.pem_cursor += 1;
                     }
                     _ => {}
                 }
