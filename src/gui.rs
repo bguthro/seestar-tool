@@ -190,6 +190,7 @@ enum Tab {
     #[default]
     Firmware,
     ExtractPem,
+    Diagnostics,
 }
 
 /// Source for the firmware to install.
@@ -578,12 +579,109 @@ impl PemTab {
     }
 }
 
+// ── Diagnostics tab ───────────────────────────────────────────────────────────
+
+struct DiagnosticsTab {
+    host: String,
+    apk_path: String,
+    log: Vec<String>,
+    result: Option<crate::firmware::DiagnosticsData>,
+    busy: bool,
+    tx: Option<Sender>,
+    rx: Option<Receiver>,
+    pem_key: Option<Vec<u8>>,
+    pem_rx: Option<Receiver>,
+    last_pem_path: String,
+    save_status: Option<String>,
+    rt: Arc<tokio::runtime::Runtime>,
+}
+
+impl DiagnosticsTab {
+    fn new(rt: Arc<tokio::runtime::Runtime>) -> Self {
+        Self {
+            host: "seestar.local".to_string(),
+            apk_path: String::new(),
+            log: vec![],
+            result: None,
+            busy: false,
+            tx: None,
+            rx: None,
+            pem_key: None,
+            pem_rx: None,
+            last_pem_path: String::new(),
+            save_status: None,
+            rt,
+        }
+    }
+
+    fn maybe_refresh_pem(&mut self, apk_path: &str) {
+        if apk_path.is_empty() || apk_path == self.last_pem_path {
+            return;
+        }
+        if !std::path::Path::new(apk_path).exists() {
+            return;
+        }
+        self.last_pem_path = apk_path.to_string();
+        self.pem_key = None;
+        let (tx, rx) = channel();
+        self.pem_rx = Some(rx);
+        crate::runner::extract_pem(&self.rt, tx, apk_path.to_string());
+    }
+
+    fn poll(&mut self) {
+        // Drain background PEM extraction
+        if let Some(rx) = &self.pem_rx {
+            for msg in rx.try_iter() {
+                if let TaskMsg::PemKeys(keys) = msg
+                    && let Some(key) = keys.into_iter().next()
+                {
+                    self.pem_key = Some(key.into_bytes());
+                }
+            }
+        }
+
+        let msgs: Vec<TaskMsg> = self
+            .rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for msg in msgs {
+            match msg {
+                TaskMsg::Log(s) => self.log.push(s),
+                TaskMsg::DiagnosticsResult(data) => self.result = Some(data),
+                TaskMsg::Done => self.busy = false,
+                TaskMsg::Error(e) => {
+                    self.log.push(format!("ERROR: {}", e));
+                    self.busy = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn start_run(&mut self) {
+        let Some(pem_key) = self.pem_key.clone() else {
+            self.log
+                .push("No PEM key available — select an APK/XAPK file first.".to_string());
+            return;
+        };
+        let (tx, rx) = channel();
+        self.tx = Some(tx.clone());
+        self.rx = Some(rx);
+        self.busy = true;
+        self.log.clear();
+        self.result = None;
+        crate::runner::run_diagnostics(&self.rt, tx, self.host.clone(), pem_key);
+    }
+}
+
 // ── Top-level App ─────────────────────────────────────────────────────────────
 
 pub struct SeestarApp {
     tab: Tab,
     fw: FirmwareTab,
     pem: PemTab,
+    diag: DiagnosticsTab,
 }
 
 impl SeestarApp {
@@ -595,7 +693,8 @@ impl SeestarApp {
         Self {
             tab: Tab::default(),
             fw: FirmwareTab::new(rt.clone()),
-            pem: PemTab::new(rt),
+            pem: PemTab::new(rt.clone()),
+            diag: DiagnosticsTab::new(rt),
         }
     }
 }
@@ -604,8 +703,13 @@ impl eframe::App for SeestarApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.fw.poll();
         self.pem.poll();
+        self.diag.poll();
+        if !self.diag.apk_path.is_empty() {
+            let path = self.diag.apk_path.clone();
+            self.diag.maybe_refresh_pem(&path);
+        }
 
-        if self.fw.busy || self.pem.busy {
+        if self.fw.busy || self.pem.busy || self.diag.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
 
@@ -631,12 +735,16 @@ impl eframe::App for SeestarApp {
                     // Tab buttons
                     let fw_active = self.tab == Tab::Firmware;
                     let pem_active = self.tab == Tab::ExtractPem;
+                    let diag_active = self.tab == Tab::Diagnostics;
 
                     if tab_btn(ui, "Firmware Update", fw_active).clicked() {
                         self.tab = Tab::Firmware;
                     }
                     if tab_btn(ui, "Extract PEM", pem_active).clicked() {
                         self.tab = Tab::ExtractPem;
+                    }
+                    if tab_btn(ui, "Diagnostics", diag_active).clicked() {
+                        self.tab = Tab::Diagnostics;
                     }
                 });
             });
@@ -646,6 +754,7 @@ impl eframe::App for SeestarApp {
             .show(ctx, |ui| match self.tab {
                 Tab::Firmware => draw_firmware(ui, &mut self.fw),
                 Tab::ExtractPem => draw_pem(ui, &mut self.pem),
+                Tab::Diagnostics => draw_diagnostics(ui, &mut self.diag),
             });
 
         // Confirmation modal — blocks other interaction
@@ -1324,4 +1433,170 @@ fn draw_pem(ui: &mut egui::Ui, pem: &mut PemTab) {
             ui.label(RichText::new(status).color(color).size(13.0));
         }
     }
+}
+
+fn draw_diagnostics(ui: &mut egui::Ui, diag: &mut DiagnosticsTab) {
+    card_frame().show(ui, |ui| {
+        ui.vertical(|ui| {
+            section_label(ui, "TARGET SCOPE");
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Host").color(c_muted()).size(13.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut diag.host)
+                        .hint_text("seestar.local")
+                        .desired_width(200.0),
+                );
+            });
+
+            ui.add_space(8.0);
+
+            file_row(
+                ui,
+                "APK / XAPK",
+                &mut diag.apk_path,
+                "Path to .apk or .xapk (for PEM key)",
+                Some(("APK / XAPK", &["apk", "xapk"])),
+            );
+
+            ui.add_space(4.0);
+            let key_status = if diag.pem_key.is_some() {
+                RichText::new("PEM key ready").color(c_success()).size(12.0)
+            } else if diag.apk_path.is_empty() {
+                RichText::new("Select an APK to extract the PEM key")
+                    .color(c_muted())
+                    .size(12.0)
+            } else {
+                RichText::new("Extracting PEM key…")
+                    .color(c_muted())
+                    .size(12.0)
+            };
+            ui.label(key_status);
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                let ready = diag.pem_key.is_some() && !diag.busy;
+                if ui
+                    .add_enabled(ready, primary_btn("Run Diagnostics"))
+                    .clicked()
+                {
+                    diag.start_run();
+                }
+                if diag.busy {
+                    ui.add_space(8.0);
+                    ui.spinner();
+                }
+            });
+        });
+    });
+
+    ui.add_space(8.0);
+
+    // Wrap the log + results in a scroll area so both panels are always reachable.
+    egui::ScrollArea::vertical()
+        .id_salt("diag_scroll")
+        .show(ui, |ui| {
+            if !diag.log.is_empty() {
+                code_frame().show(ui, |ui| {
+                    for line in &diag.log {
+                        let color = if line.starts_with("ERROR") {
+                            c_error()
+                        } else {
+                            c_muted()
+                        };
+                        ui.label(
+                            RichText::new(line)
+                                .color(color)
+                                .size(12.0)
+                                .font(egui::FontId::monospace(12.0)),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+            }
+
+            if let Some(ref data) = diag.result {
+                let device_state_str = serde_json::to_string_pretty(&data.device_state)
+                    .unwrap_or_else(|_| data.device_state.to_string());
+                let pi_info_str = serde_json::to_string_pretty(&data.pi_info)
+                    .unwrap_or_else(|_| data.pi_info.to_string());
+
+                // Save button row
+                ui.horizontal(|ui| {
+                    if ui.add(secondary_btn("Save to file…")).clicked() {
+                        let combined = serde_json::json!({
+                            "get_device_state": data.device_state,
+                            "pi_get_info": data.pi_info,
+                        });
+                        let json = serde_json::to_string_pretty(&combined)
+                            .unwrap_or_else(|_| combined.to_string());
+                        diag.save_status = Some(
+                            if let Some(dest) = rfd::FileDialog::new()
+                                .add_filter("JSON", &["json"])
+                                .set_file_name("seestar_diagnostics.json")
+                                .save_file()
+                            {
+                                match std::fs::write(&dest, &json) {
+                                    Ok(_) => format!("Saved to {}", dest.display()),
+                                    Err(e) => format!("Save failed: {e}"),
+                                }
+                            } else {
+                                return;
+                            },
+                        );
+                    }
+                    if let Some(ref status) = diag.save_status {
+                        let color = if status.starts_with("Save failed") {
+                            c_error()
+                        } else {
+                            c_success()
+                        };
+                        ui.label(RichText::new(status).color(color).size(13.0));
+                    }
+                });
+                ui.add_space(6.0);
+
+                card_frame().show(ui, |ui| {
+                    section_label(ui, "GET_DEVICE_STATE");
+                    ui.add_space(4.0);
+                    code_frame().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("diag_device_state")
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut device_state_str.as_str())
+                                        .font(egui::FontId::monospace(12.0))
+                                        .text_color(c_text())
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                card_frame().show(ui, |ui| {
+                    section_label(ui, "PI_GET_INFO");
+                    ui.add_space(4.0);
+                    code_frame().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("diag_pi_info")
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut pi_info_str.as_str())
+                                        .font(egui::FontId::monospace(12.0))
+                                        .text_color(c_text())
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    });
+                });
+            }
+        });
 }

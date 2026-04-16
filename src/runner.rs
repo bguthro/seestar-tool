@@ -381,6 +381,41 @@ pub fn install_iscope(
     });
 }
 
+/// Authenticate to the scope and collect diagnostic API responses.
+/// Sends `TaskMsg::DiagnosticsResult` on success, `TaskMsg::Error` on failure.
+pub fn run_diagnostics(
+    rt: &Arc<tokio::runtime::Runtime>,
+    tx: Sender,
+    host: String,
+    pem_key: Vec<u8>,
+) {
+    rt.spawn(async move {
+        let _ = tx.send(TaskMsg::Log(format!(
+            "Connecting to {} for diagnostics…",
+            host
+        )));
+        let tx_log = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::firmware::run_diagnostics(&host, &pem_key, move |s| {
+                let _ = tx_log.send(TaskMsg::Log(s));
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(data)) => {
+                let _ = tx.send(TaskMsg::DiagnosticsResult(data));
+                let _ = tx.send(TaskMsg::Done);
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(TaskMsg::Error(e.to_string()));
+            }
+            Err(e) => {
+                let _ = tx.send(TaskMsg::Error(e.to_string()));
+            }
+        }
+    });
+}
+
 /// Extract PEM private keys from a Seestar APK/XAPK.
 pub fn extract_pem(rt: &Arc<tokio::runtime::Runtime>, tx: Sender, apk_path: String) {
     rt.spawn(async move {

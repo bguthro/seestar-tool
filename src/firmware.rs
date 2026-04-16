@@ -121,6 +121,13 @@ impl DeviceInfo {
     }
 }
 
+/// Raw API responses collected during a diagnostics run.
+#[derive(Debug, Clone)]
+pub struct DiagnosticsData {
+    pub device_state: serde_json::Value,
+    pub pi_info: serde_json::Value,
+}
+
 // ── iscope validation ─────────────────────────────────────────────────────────
 
 /// Minimum acceptable size for an iscope firmware binary.
@@ -653,12 +660,34 @@ pub fn detect_scope_model(
     detect_scope_model_on_port(address, API_PORT, pem_key, log)
 }
 
-fn detect_scope_model_on_port(
+/// Read lines from `stream`, skipping async Event pushes, until a non-event response arrives.
+fn recv_api_response(stream: &mut TcpStream, log: &impl Fn(String)) -> Result<serde_json::Value> {
+    loop {
+        let line = recv_line(stream)?;
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|_| anyhow!("Invalid JSON from scope: {}", line))?;
+        if v.get("Event").is_some() {
+            log(format!(
+                "(skipping event: {})",
+                v["Event"].as_str().unwrap_or("?")
+            ));
+            continue;
+        }
+        break Ok(v);
+    }
+}
+
+/// Authenticate to the scope API and return the open `TcpStream`.
+///
+/// Performs the three-step challenge-response handshake (get_verify_str →
+/// verify_client → pi_is_verified).  The returned stream is ready for
+/// subsequent JSON-RPC calls.
+fn authenticate_stream(
     address: &str,
     port: u16,
     pem_key: &[u8],
-    log: impl Fn(String),
-) -> Result<DeviceInfo> {
+    log: &impl Fn(String),
+) -> Result<TcpStream> {
     use base64::Engine;
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::DecodePrivateKey;
@@ -745,22 +774,23 @@ fn detect_scope_model_on_port(
     log(format!("<- {}", pi_ack));
     // Non-zero result is non-fatal (seestar_alp also ignores it)
 
+    Ok(stream)
+}
+
+fn detect_scope_model_on_port(
+    address: &str,
+    port: u16,
+    pem_key: &[u8],
+    log: impl Fn(String),
+) -> Result<DeviceInfo> {
+    use std::io::Write;
+
+    let mut stream = authenticate_stream(address, port, pem_key, &log)?;
+
     // get_device_state — skip any async event pushes while waiting for our response
     let state_req = serde_json::json!({"id":4,"method":"get_device_state","params":[]});
     stream.write_all(format!("{}\r\n", state_req).as_bytes())?;
-    let state_v = loop {
-        let line = recv_line(&mut stream)?;
-        let v: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|_| anyhow!("Invalid JSON from scope: {}", line))?;
-        if v.get("Event").is_some() {
-            log(format!(
-                "(skipping event: {})",
-                v["Event"].as_str().unwrap_or("?")
-            ));
-            continue;
-        }
-        break v;
-    };
+    let state_v = recv_api_response(&mut stream, &log)?;
     let product_model = state_v["result"]["device"]["product_model"]
         .as_str()
         .ok_or_else(|| anyhow!("No product_model in: {}", state_v))?;
@@ -812,6 +842,43 @@ fn detect_scope_model_on_port(
         firmware_ver_string,
         battery_capacity,
         battery_charging,
+    })
+}
+
+/// Authenticate to the scope and collect `get_device_state` + `pi_get_info` responses.
+pub fn run_diagnostics(
+    address: &str,
+    pem_key: &[u8],
+    log: impl Fn(String),
+) -> Result<DiagnosticsData> {
+    run_diagnostics_on_port(address, API_PORT, pem_key, log)
+}
+
+pub(crate) fn run_diagnostics_on_port(
+    address: &str,
+    port: u16,
+    pem_key: &[u8],
+    log: impl Fn(String),
+) -> Result<DiagnosticsData> {
+    use std::io::Write;
+
+    let mut stream = authenticate_stream(address, port, pem_key, &log)?;
+
+    // get_device_state
+    let state_req = serde_json::json!({"id":4,"method":"get_device_state","params":[]});
+    stream.write_all(format!("{}\r\n", state_req).as_bytes())?;
+    let device_state = recv_api_response(&mut stream, &log)?;
+    log("get_device_state: OK".to_string());
+
+    // pi_get_info
+    let info_req = serde_json::json!({"id":5,"method":"pi_get_info","params":[]});
+    stream.write_all(format!("{}\r\n", info_req).as_bytes())?;
+    let pi_info = recv_api_response(&mut stream, &log)?;
+    log("pi_get_info: OK".to_string());
+
+    Ok(DiagnosticsData {
+        device_state,
+        pi_info,
     })
 }
 
@@ -1726,6 +1793,86 @@ mod tests {
             |_, _| {},
         );
         assert!(result.is_ok());
+    }
+
+    // ── run_diagnostics ───────────────────────────────────────────────────────
+
+    /// Spawn a mock API server that handles the full diagnostics exchange.
+    fn serve_diagnostics_once(
+        product_model: &'static str,
+        pi_info_result: serde_json::Value,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            // auth handshake
+            recv_line(&mut conn).unwrap();
+            let challenge_resp =
+                serde_json::json!({"id":1,"result":{"str":"test-challenge-12345"}});
+            conn.write_all(format!("{}\r\n", challenge_resp).as_bytes())
+                .unwrap();
+            recv_line(&mut conn).unwrap();
+            conn.write_all(b"{\"id\":2,\"code\":0}\r\n").unwrap();
+            recv_line(&mut conn).unwrap();
+            conn.write_all(b"{\"id\":3,\"code\":0}\r\n").unwrap();
+
+            // get_device_state
+            recv_line(&mut conn).unwrap();
+            let state = serde_json::json!({
+                "id": 4,
+                "result": {
+                    "device": {"product_model": product_model, "firmware_ver_string": "4.70"},
+                    "pi_status": {"battery_capacity": 85, "charger_status": "Discharging"}
+                }
+            });
+            conn.write_all(format!("{}\r\n", state).as_bytes()).unwrap();
+
+            // pi_get_info
+            recv_line(&mut conn).unwrap();
+            let info = serde_json::json!({"id": 5, "result": pi_info_result});
+            conn.write_all(format!("{}\r\n", info).as_bytes()).unwrap();
+        });
+        addr
+    }
+
+    #[test]
+    fn run_diagnostics_on_port_returns_both_responses() {
+        let pi_info = serde_json::json!({"model": "Raspberry Pi Zero 2W", "serial": "abc123"});
+        let addr = serve_diagnostics_once("Seestar S50", pi_info.clone());
+        let pem = make_test_pem_key();
+        let data = run_diagnostics_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
+        assert_eq!(
+            data.device_state["result"]["device"]["product_model"],
+            "Seestar S50"
+        );
+        assert_eq!(data.pi_info["result"], pi_info);
+    }
+
+    #[test]
+    fn run_diagnostics_on_port_connection_refused_returns_error() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let pem = make_test_pem_key();
+        let err = run_diagnostics_on_port("127.0.0.1", port, &pem, |_| {}).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn run_diagnostics_on_port_auth_failure_returns_error() {
+        let addr = serve_api_once("Seestar S50", 1); // code != 0
+        let pem = make_test_pem_key();
+        let err = run_diagnostics_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("Authentication failed"),
+            "expected auth error, got: {}",
+            err
+        );
     }
 
     // ── recv_line ─────────────────────────────────────────────────────────────

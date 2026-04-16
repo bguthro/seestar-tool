@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::apkpure::ApkVersion;
-use crate::firmware::DeviceInfo;
+use crate::firmware::{DeviceInfo, DiagnosticsData};
 
 #[derive(Debug, Clone)]
 pub enum TaskMsg {
@@ -15,6 +15,8 @@ pub enum TaskMsg {
     PemKeys(Vec<String>),
     /// Auto-detection succeeded — UI should show `DeviceInfo` and ask user to confirm.
     ModelDetected(DeviceInfo),
+    /// Diagnostics run completed — carries the raw API responses.
+    DiagnosticsResult(DiagnosticsData),
     Done,
     Error(String),
 }
