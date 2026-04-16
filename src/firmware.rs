@@ -1380,7 +1380,9 @@ mod tests {
                 c.write_all(b"{\"result\":\"ok\"}\r\n").unwrap();
                 drop(c);
                 drop(cmd_listener);
-                std::thread::sleep(Duration::from_millis(20));
+                // Stay offline long enough for the 100ms poll in wait_for_scope
+                // to observe the port as closed before we rebind.
+                std::thread::sleep(Duration::from_millis(200));
                 let new_l = TcpListener::bind(format!("127.0.0.1:{}", cmd_port)).unwrap();
                 if let Ok((mut c, _)) = new_l.accept() {
                     c.write_all(b"{\"name\":\"seestar-s50\"}\r\n").unwrap();
