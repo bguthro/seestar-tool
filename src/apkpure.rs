@@ -48,7 +48,9 @@ async fn api_get(url: &str) -> Result<Vec<u8>> {
     // Wrap entire request in explicit timeout to ensure we fail fast offline.
     // Even with client-level timeouts, the connection attempt or DNS can
     // sometimes hang on certain systems when offline.
-    match tokio::time::timeout(Duration::from_secs(2), api_get_inner(url)).await {
+    let timeout_result = tokio::time::timeout(Duration::from_secs(2), api_get_inner(url)).await;
+
+    match timeout_result {
         Ok(result) => result,
         Err(_) => Err(anyhow!("APKPure request timed out (likely offline)")),
     }
