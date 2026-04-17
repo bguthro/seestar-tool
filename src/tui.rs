@@ -58,6 +58,7 @@ enum Focus {
     PemSaveButton,
     DiagHost,
     DiagApkPath,
+    DiagPemFilePath,
     DiagButton,
     DiagSaveButton,
     Logs,
@@ -121,6 +122,7 @@ enum BrowserTarget {
     Iscope,
     Pem,
     DiagApk,
+    DiagPemFile,
     /// Directory to save the diagnostics JSON into.
     SaveDiagDir,
     /// Directory to save the PEM file into.
@@ -348,9 +350,12 @@ struct App {
     diag_host_cursor: usize,
     diag_apk_path: String,
     diag_apk_cursor: usize,
+    diag_pem_file_path: String,
+    diag_pem_file_cursor: usize,
     diag_pem_key: Option<Vec<u8>>,
     diag_pem_rx: Option<task::Receiver>,
     diag_last_pem_path: String,
+    diag_last_pem_file_path: String,
     diag_result: Option<crate::firmware::DiagnosticsData>,
     diag_rx: Option<task::Receiver>,
     diag_busy: bool,
@@ -395,9 +400,12 @@ impl App {
             diag_host_cursor: "seestar.local".len(),
             diag_apk_path: String::new(),
             diag_apk_cursor: 0,
+            diag_pem_file_path: String::new(),
+            diag_pem_file_cursor: 0,
             diag_pem_key: None,
             diag_pem_rx: None,
             diag_last_pem_path: String::new(),
+            diag_last_pem_file_path: String::new(),
             diag_result: None,
             diag_rx: None,
             diag_busy: false,
@@ -889,6 +897,11 @@ impl App {
                 &self.diag_apk_path,
                 &["apk", "xapk"],
             ),
+            Focus::DiagPemFilePath => (
+                BrowserTarget::DiagPemFile,
+                &self.diag_pem_file_path,
+                &["pem"],
+            ),
             _ => return,
         };
         self.file_browser = Some(FileBrowser::open_file(start, target, filter));
@@ -919,6 +932,12 @@ impl App {
                 self.diag_apk_cursor = s.len();
                 self.diag_apk_path = s;
                 self.maybe_refresh_diag_pem();
+            }
+            Some(BrowserTarget::DiagPemFile) => {
+                let s = path.to_string_lossy().to_string();
+                self.diag_pem_file_cursor = s.len();
+                self.diag_pem_file_path = s;
+                self.maybe_refresh_diag_pem_file();
             }
             Some(BrowserTarget::SaveDiagDir) => {
                 self.do_save_diag_to(path);
@@ -1273,11 +1292,28 @@ impl App {
         crate::runner::extract_pem(&self.rt, tx, path);
     }
 
+    fn maybe_refresh_diag_pem_file(&mut self) {
+        let path = self.diag_pem_file_path.clone();
+        if path.is_empty() || path == self.diag_last_pem_file_path {
+            return;
+        }
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        self.diag_last_pem_file_path = path.clone();
+        if let Ok(bytes) = std::fs::read(&path) {
+            self.diag_pem_key = Some(bytes);
+            // Clear APK path so the two sources don't conflict
+            self.diag_apk_path.clear();
+            self.diag_last_pem_path.clear();
+        }
+    }
+
     fn start_diagnostics(&mut self) {
         let Some(pem_key) = self.diag_pem_key.clone() else {
             self.push_log(
                 Style::default().fg(Color::Yellow),
-                "No PEM key — select an APK/XAPK first.".to_string(),
+                "No PEM key — select an APK/XAPK or a .pem file first.".to_string(),
             );
             return;
         };
@@ -1311,7 +1347,7 @@ impl App {
                 KeyCode::Enter => {
                     self.open_browser_for_focus();
                 }
-                KeyCode::Tab => self.focus = Focus::DiagButton,
+                KeyCode::Tab => self.focus = Focus::DiagPemFilePath,
                 KeyCode::BackTab => self.focus = Focus::DiagHost,
                 KeyCode::Char(c) => {
                     self.diag_apk_path.insert(self.diag_apk_cursor, c);
@@ -1328,10 +1364,33 @@ impl App {
                 }
                 _ => {}
             },
+            Focus::DiagPemFilePath => match code {
+                KeyCode::Enter => {
+                    self.open_browser_for_focus();
+                }
+                KeyCode::Tab => self.focus = Focus::DiagButton,
+                KeyCode::BackTab => self.focus = Focus::DiagApkPath,
+                KeyCode::Char(c) => {
+                    self.diag_pem_file_path.insert(self.diag_pem_file_cursor, c);
+                    self.diag_pem_file_cursor += 1;
+                    self.maybe_refresh_diag_pem_file();
+                }
+                KeyCode::Backspace if self.diag_pem_file_cursor > 0 => {
+                    self.diag_pem_file_cursor -= 1;
+                    self.diag_pem_file_path.remove(self.diag_pem_file_cursor);
+                }
+                KeyCode::Left => {
+                    self.diag_pem_file_cursor = self.diag_pem_file_cursor.saturating_sub(1);
+                }
+                KeyCode::Right if self.diag_pem_file_cursor < self.diag_pem_file_path.len() => {
+                    self.diag_pem_file_cursor += 1;
+                }
+                _ => {}
+            },
             Focus::DiagButton => match code {
                 KeyCode::Enter | KeyCode::Char(' ') => self.start_diagnostics(),
                 KeyCode::Tab => self.focus = Focus::DiagSaveButton,
-                KeyCode::BackTab => self.focus = Focus::DiagApkPath,
+                KeyCode::BackTab => self.focus = Focus::DiagPemFilePath,
                 _ => {}
             },
             Focus::DiagSaveButton => match code {
@@ -2166,6 +2225,7 @@ fn draw_diagnostics(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(3),                              // host
             Constraint::Length(3),                              // apk path
+            Constraint::Length(3),                              // pem file path
             Constraint::Length(3),                              // run button + key status
             Constraint::Length(if has_result { 3 } else { 0 }), // save button row
             Constraint::Min(6),                                 // results / logs
@@ -2184,17 +2244,26 @@ fn draw_diagnostics(f: &mut ratatui::Frame, app: &App, area: Rect) {
     draw_text_input(
         f,
         chunks[1],
-        "APK / XAPK  [Enter = browse]",
+        "APK / XAPK  [Enter = browse]  (or use PEM file below)",
         &app.diag_apk_path,
         app.diag_apk_cursor,
         app.focus == Focus::DiagApkPath && app.file_browser.is_none(),
+    );
+
+    draw_text_input(
+        f,
+        chunks[2],
+        "PEM File  [Enter = browse]  (alternative to APK)",
+        &app.diag_pem_file_path,
+        app.diag_pem_file_cursor,
+        app.focus == Focus::DiagPemFilePath && app.file_browser.is_none(),
     );
 
     // Button row with key status indicator
     let btn_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(chunks[2]);
+        .split(chunks[3]);
 
     let btn_focused = app.focus == Focus::DiagButton && app.file_browser.is_none();
     let btn_ready = app.diag_pem_key.is_some() && !app.diag_busy;
@@ -2223,11 +2292,13 @@ fn draw_diagnostics(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
     let key_status = if app.diag_pem_key.is_some() {
         Span::styled("PEM key ready", Style::default().fg(Color::Green))
-    } else if app.diag_apk_path.is_empty() {
+    } else if app.diag_apk_path.is_empty() && app.diag_pem_file_path.is_empty() {
         Span::styled(
-            "Select an APK/XAPK to extract the PEM key",
+            "Select an APK/XAPK or a .pem file",
             Style::default().fg(Color::DarkGray),
         )
+    } else if !app.diag_pem_file_path.is_empty() {
+        Span::styled("Loading PEM key…", Style::default().fg(Color::Yellow))
     } else {
         Span::styled("Extracting PEM key…", Style::default().fg(Color::Yellow))
     };
@@ -2250,7 +2321,7 @@ fn draw_diagnostics(f: &mut ratatui::Frame, app: &App, area: Rect) {
             .alignment(Alignment::Center)
             .style(save_style)
             .block(Block::default().borders(Borders::ALL));
-        f.render_widget(save_btn, chunks[3]);
+        f.render_widget(save_btn, chunks[4]);
     }
 
     // Results pane: show device_state and pi_info if available, else show logs
@@ -2258,7 +2329,7 @@ fn draw_diagnostics(f: &mut ratatui::Frame, app: &App, area: Rect) {
         let result_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[4]);
+            .split(chunks[5]);
 
         let ds_text = serde_json::to_string_pretty(&data.device_state)
             .unwrap_or_else(|_| data.device_state.to_string());
@@ -2302,7 +2373,7 @@ fn draw_diagnostics(f: &mut ratatui::Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false });
         f.render_widget(pi_par, result_chunks[1]);
     } else {
-        draw_logs(f, app, chunks[4]);
+        draw_logs(f, app, chunks[5]);
     }
 }
 

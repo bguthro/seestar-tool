@@ -584,6 +584,7 @@ impl PemTab {
 struct DiagnosticsTab {
     host: String,
     apk_path: String,
+    pem_file_path: String,
     log: Vec<String>,
     result: Option<crate::firmware::DiagnosticsData>,
     busy: bool,
@@ -592,6 +593,7 @@ struct DiagnosticsTab {
     pem_key: Option<Vec<u8>>,
     pem_rx: Option<Receiver>,
     last_pem_path: String,
+    last_pem_file_path: String,
     save_status: Option<String>,
     rt: Arc<tokio::runtime::Runtime>,
 }
@@ -601,6 +603,7 @@ impl DiagnosticsTab {
         Self {
             host: "seestar.local".to_string(),
             apk_path: String::new(),
+            pem_file_path: String::new(),
             log: vec![],
             result: None,
             busy: false,
@@ -609,6 +612,7 @@ impl DiagnosticsTab {
             pem_key: None,
             pem_rx: None,
             last_pem_path: String::new(),
+            last_pem_file_path: String::new(),
             save_status: None,
             rt,
         }
@@ -626,6 +630,23 @@ impl DiagnosticsTab {
         let (tx, rx) = channel();
         self.pem_rx = Some(rx);
         crate::runner::extract_pem(&self.rt, tx, apk_path.to_string());
+    }
+
+    fn maybe_refresh_pem_file(&mut self) {
+        let path = self.pem_file_path.clone();
+        if path.is_empty() || path == self.last_pem_file_path {
+            return;
+        }
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        self.last_pem_file_path = path.clone();
+        if let Ok(bytes) = std::fs::read(&path) {
+            self.pem_key = Some(bytes);
+            // Clear APK path so the two sources don't conflict
+            self.apk_path.clear();
+            self.last_pem_path.clear();
+        }
     }
 
     fn poll(&mut self) {
@@ -708,6 +729,7 @@ impl eframe::App for SeestarApp {
             let path = self.diag.apk_path.clone();
             self.diag.maybe_refresh_pem(&path);
         }
+        self.diag.maybe_refresh_pem_file();
 
         if self.fw.busy || self.pem.busy || self.diag.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
@@ -1456,15 +1478,31 @@ fn draw_diagnostics(ui: &mut egui::Ui, diag: &mut DiagnosticsTab) {
                 ui,
                 "APK / XAPK",
                 &mut diag.apk_path,
-                "Path to .apk or .xapk (for PEM key)",
+                "Path to .apk or .xapk (to extract PEM key)",
                 Some(("APK / XAPK", &["apk", "xapk"])),
+            );
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("— or —").color(c_muted()).size(11.0));
+            ui.add_space(4.0);
+
+            file_row(
+                ui,
+                "PEM File",
+                &mut diag.pem_file_path,
+                "Path to .pem file (alternative to APK)",
+                Some(("PEM File", &["pem"])),
             );
 
             ui.add_space(4.0);
             let key_status = if diag.pem_key.is_some() {
                 RichText::new("PEM key ready").color(c_success()).size(12.0)
-            } else if diag.apk_path.is_empty() {
-                RichText::new("Select an APK to extract the PEM key")
+            } else if diag.apk_path.is_empty() && diag.pem_file_path.is_empty() {
+                RichText::new("Select an APK/XAPK or a .pem file")
+                    .color(c_muted())
+                    .size(12.0)
+            } else if !diag.pem_file_path.is_empty() {
+                RichText::new("Loading PEM key…")
                     .color(c_muted())
                     .size(12.0)
             } else {
