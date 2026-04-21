@@ -2391,6 +2391,7 @@ mod tests {
             firmware_ver_string: Some("4.70".to_string()),
             battery_capacity: Some(80),
             battery_charging: false,
+            firmware_platform: None,
         }
     }
 

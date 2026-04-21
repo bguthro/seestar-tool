@@ -158,9 +158,17 @@ fn resolve_model(
     }) {
         Ok(info) => {
             let _ = tx.send(TaskMsg::Log(format!(
-                "Auto-detected: {}",
-                info.model.display_name()
+                "Auto-detected: {} ({})",
+                info.model.display_name(),
+                info.model.bitness_description(),
             )));
+            if let Some(p) = info.firmware_platform {
+                let _ = tx.send(TaskMsg::Log(format!(
+                    "firmware_platform: {} ({})",
+                    p,
+                    if p == 1 { "64-bit ARM" } else { "32-bit ARM" },
+                )));
+            }
             if let Some(fw) = &info.firmware_ver_string {
                 let _ = tx.send(TaskMsg::Log(format!("Scope firmware: {}", fw)));
             }

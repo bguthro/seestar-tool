@@ -82,6 +82,11 @@ pub struct DeviceInfo {
     pub battery_capacity: Option<u8>,
     /// True when the scope reports it is not discharging (i.e. charging or full).
     pub battery_charging: bool,
+    /// Raw `firmware_platform` integer from the device state response.
+    /// `1` = 64-bit ARM aarch64 (iscope_64); `0` or absent = 32-bit ARMv7 (iscope).
+    /// This is the authoritative source used by the official Seestar app to select
+    /// the firmware binary — it takes precedence over `product_model` string matching.
+    pub firmware_platform: Option<i64>,
 }
 
 impl DeviceInfo {
@@ -809,22 +814,84 @@ fn detect_scope_model_on_port(
 
     log(format!("product_model: {}", product_model));
 
-    // Be strict: only accept known model strings. Defaulting on an unrecognised
-    // model would flash the wrong firmware variant and could brick the scope.
+    // firmware_platform is the authoritative field used by the official Seestar app:
+    // 1 = 64-bit ARM aarch64 (iscope_64), anything else or absent = 32-bit ARMv7 (iscope).
+    let firmware_platform = state_v["result"]["device"]["firmware_platform"].as_i64();
+    if let Some(p) = firmware_platform {
+        log(format!("firmware_platform: {}", p));
+    }
+
+    // Derive expected model from product_model string.
     // Check "S30 Pro" before "S30" — the latter is a substring of the former.
-    let model = if product_model.contains("S30 Pro") {
-        ScopeModel::S30Pro
+    let model_from_product = if product_model.contains("S30 Pro") {
+        Some(ScopeModel::S30Pro)
     } else if product_model.contains("S30") {
-        ScopeModel::S30
+        Some(ScopeModel::S30)
     } else if product_model.contains("S50") {
-        ScopeModel::S50
+        Some(ScopeModel::S50)
     } else {
-        return Err(anyhow!(
-            "Unrecognized product_model '{}'. \
-             Cannot safely determine the firmware variant — aborting. \
-             Select your model manually (S50, S30, or S30 Pro).",
-            product_model
-        ));
+        None
+    };
+
+    // firmware_platform == 1 → 64-bit (iscope_64); anything else → 32-bit (iscope).
+    let platform_wants_64bit = firmware_platform.map(|p| p == 1);
+
+    let model = match (model_from_product, platform_wants_64bit) {
+        (Some(mp), Some(wants_64)) => {
+            // Both present: cross-check that they agree on the firmware bitness.
+            let model_wants_64 = matches!(mp, ScopeModel::S30Pro);
+            if model_wants_64 != wants_64 {
+                return Err(anyhow!(
+                    "Firmware platform mismatch for '{}': product_model implies {} \
+                     but firmware_platform={} implies {}. \
+                     Aborting to avoid flashing the wrong binary — this could brick the scope.",
+                    product_model,
+                    if model_wants_64 {
+                        "64-bit (iscope_64)"
+                    } else {
+                        "32-bit (iscope)"
+                    },
+                    firmware_platform.unwrap(),
+                    if wants_64 {
+                        "64-bit (iscope_64)"
+                    } else {
+                        "32-bit (iscope)"
+                    },
+                ));
+            }
+            mp
+        }
+        (Some(mp), None) => {
+            // firmware_platform absent: warn and fall back to product_model-based detection.
+            log(format!(
+                "⚠️  firmware_platform field absent in device state; \
+                 inferring firmware variant from product_model '{}'.",
+                product_model
+            ));
+            mp
+        }
+        (None, Some(wants_64)) => {
+            // Unknown product_model but firmware_platform is present: use it as authoritative.
+            log(format!(
+                "⚠️  Unknown product_model '{}'; \
+                 using firmware_platform={} to select firmware variant.",
+                product_model,
+                firmware_platform.unwrap()
+            ));
+            if wants_64 {
+                ScopeModel::S30Pro
+            } else {
+                ScopeModel::S50
+            }
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "Unrecognized product_model '{}' and firmware_platform field is absent. \
+                 Cannot safely determine the firmware variant — aborting. \
+                 Select your model manually (S50, S30, or S30 Pro).",
+                product_model
+            ));
+        }
     };
 
     // Parse optional device info — missing fields are treated as unknown.
@@ -840,13 +907,17 @@ fn detect_scope_model_on_port(
         .unwrap_or(false);
 
     log(format!(
-        "firmware: {}  battery: {}{}",
+        "firmware: {}  battery: {}{}  platform: {}",
         firmware_ver_string.as_deref().unwrap_or("unknown"),
         battery_capacity
             .map(|p| format!("{}%", p))
             .as_deref()
             .unwrap_or("unknown"),
         if battery_charging { " (charging)" } else { "" },
+        firmware_platform
+            .map(|p| p.to_string())
+            .as_deref()
+            .unwrap_or("absent"),
     ));
 
     Ok(DeviceInfo {
@@ -854,6 +925,7 @@ fn detect_scope_model_on_port(
         firmware_ver_string,
         battery_capacity,
         battery_charging,
+        firmware_platform,
     })
 }
 
@@ -1034,19 +1106,6 @@ mod tests {
         assert!(
             err.to_string().contains("32-bit"),
             "expected 32-bit mismatch error, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn detect_scope_model_unknown_product_model_returns_error() {
-        // A product_model that contains neither S50 nor S30 should be rejected.
-        let addr = serve_api_once("Seestar X99", 0);
-        let pem = make_test_pem_key();
-        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
-        assert!(
-            err.to_string().contains("Unrecognized"),
-            "expected unrecognized-model error, got: {}",
             err
         );
     }
@@ -1464,6 +1523,15 @@ mod tests {
     /// `product_model` is what the server reports in `get_device_state`.
     /// `auth_code` is the code returned in the `verify_client` response.
     fn serve_api_once(product_model: &'static str, auth_code: i64) -> std::net::SocketAddr {
+        serve_api_once_with_platform(product_model, auth_code, None)
+    }
+
+    /// Like `serve_api_once` but also includes `firmware_platform` in the device state response.
+    fn serve_api_once_with_platform(
+        product_model: &'static str,
+        auth_code: i64,
+        firmware_platform: Option<i64>,
+    ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1494,13 +1562,17 @@ mod tests {
 
             // 5. Read get_device_state, reply with product_model and device info
             recv_line(&mut conn).unwrap();
+            let mut device = serde_json::json!({
+                "product_model": product_model,
+                "firmware_ver_string": "7.18"
+            });
+            if let Some(p) = firmware_platform {
+                device["firmware_platform"] = serde_json::json!(p);
+            }
             let state = serde_json::json!({
                 "id": 4,
                 "result": {
-                    "device": {
-                        "product_model": product_model,
-                        "firmware_ver_string": "7.18"
-                    },
+                    "device": device,
                     "pi_status": {
                         "battery_capacity": 80,
                         "charger_status": "Discharging"
@@ -1582,6 +1654,107 @@ mod tests {
         let pem = make_test_pem_key();
         let info = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
         assert_eq!(info.model, ScopeModel::S30Pro);
+    }
+
+    // ── firmware_platform cross-check tests ──────────────────────────────────
+
+    #[test]
+    fn detect_scope_model_platform_1_agrees_with_s30pro() {
+        let addr = serve_api_once_with_platform("Seestar S30 Pro", 0, Some(1));
+        let pem = make_test_pem_key();
+        let info = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
+        assert_eq!(info.model, ScopeModel::S30Pro);
+        assert_eq!(info.firmware_platform, Some(1));
+    }
+
+    #[test]
+    fn detect_scope_model_platform_0_agrees_with_s50() {
+        let addr = serve_api_once_with_platform("Seestar S50", 0, Some(0));
+        let pem = make_test_pem_key();
+        let info = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
+        assert_eq!(info.model, ScopeModel::S50);
+        assert_eq!(info.firmware_platform, Some(0));
+    }
+
+    #[test]
+    fn detect_scope_model_platform_1_disagrees_with_s50_returns_error() {
+        // firmware_platform=1 (64-bit) but S50 implies 32-bit → mismatch must be an error.
+        let addr = serve_api_once_with_platform("Seestar S50", 0, Some(1));
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("mismatch"),
+            "expected mismatch error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_platform_0_disagrees_with_s30pro_returns_error() {
+        // firmware_platform=0 (32-bit) but S30 Pro implies 64-bit → mismatch must be an error.
+        let addr = serve_api_once_with_platform("Seestar S30 Pro", 0, Some(0));
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("mismatch"),
+            "expected mismatch error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_absent_platform_warns_and_proceeds() {
+        // No firmware_platform field: warning is logged, model-based detection used.
+        use std::sync::{Arc, Mutex};
+        let addr = serve_api_once("Seestar S50", 0);
+        let pem = make_test_pem_key();
+        let logged: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let logged_capture = Arc::clone(&logged);
+        let info = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, move |s| {
+            logged_capture.lock().unwrap().push(s);
+        })
+        .unwrap();
+        assert_eq!(info.model, ScopeModel::S50);
+        assert_eq!(info.firmware_platform, None);
+        let msgs = logged.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("absent")),
+            "expected warning about absent firmware_platform, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn detect_scope_model_unknown_product_with_platform_1_infers_64bit() {
+        // Unrecognised product_model but firmware_platform=1 → iscope_64 (S30Pro stand-in).
+        let addr = serve_api_once_with_platform("Seestar S80", 0, Some(1));
+        let pem = make_test_pem_key();
+        let info = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
+        assert_eq!(info.model, ScopeModel::S30Pro);
+        assert_eq!(info.firmware_platform, Some(1));
+    }
+
+    #[test]
+    fn detect_scope_model_unknown_product_with_platform_0_infers_32bit() {
+        // Unrecognised product_model but firmware_platform=0 → iscope (S50 stand-in).
+        let addr = serve_api_once_with_platform("Seestar S80", 0, Some(0));
+        let pem = make_test_pem_key();
+        let info = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap();
+        assert_eq!(info.model, ScopeModel::S50);
+        assert_eq!(info.firmware_platform, Some(0));
+    }
+
+    #[test]
+    fn detect_scope_model_unknown_product_no_platform_returns_error() {
+        // Neither product_model nor firmware_platform can determine the variant → error.
+        let addr = serve_api_once("Seestar X99", 0);
+        let pem = make_test_pem_key();
+        let err = detect_scope_model_on_port("127.0.0.1", addr.port(), &pem, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("Unrecognized"),
+            "expected unrecognized-model error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -1713,6 +1886,7 @@ mod tests {
             firmware_ver_string: None,
             battery_capacity,
             battery_charging,
+            firmware_platform: None,
         }
     }
 
