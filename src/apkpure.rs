@@ -365,8 +365,7 @@ fn android_client() -> Result<reqwest::Client> {
         .default_headers(h)
         .cookie_store(true)
         .redirect(reqwest::redirect::Policy::limited(10))
-        .timeout(Duration::from_secs(3))
-        .connect_timeout(Duration::from_secs(1))
+        .connect_timeout(Duration::from_secs(10))
         .build()?)
 }
 
@@ -520,56 +519,6 @@ mod tests {
         // Verify client was created (basic smoke test since headers aren't
         // introspectable on reqwest::Client directly).
         drop(client);
-    }
-
-    #[tokio::test]
-    async fn android_client_timeout_fires_on_hung_connection() {
-        // Spin up a TCP server that accepts connections but never sends data,
-        // causing the HTTP request to hang.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Spawn a thread that accepts a connection and holds it open
-        // without sending a response.
-        std::thread::spawn(move || {
-            if let Ok((conn, _)) = listener.accept() {
-                // Keep the connection open without responding
-                // This will cause the client to timeout waiting for a response.
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                drop(conn);
-            }
-        });
-
-        // Give the listener a moment to start
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Try to make a request to the hung server.
-        let client = android_client().expect("client builds");
-        let url = format!("http://{}/hang", addr);
-
-        let start = std::time::Instant::now();
-        let result = client.get(&url).send().await;
-        let elapsed = start.elapsed();
-
-        // The timeout should have fired around 3 seconds, not much longer.
-        // Allow some margin for system variation.
-        match result {
-            Ok(_) => {
-                panic!("Request should have timed out");
-            }
-            Err(e) => {
-                assert!(
-                    e.is_timeout(),
-                    "Request errored but not due to timeout: {}",
-                    e
-                );
-                assert!(
-                    elapsed.as_secs() < 5,
-                    "Timeout took too long ({}s), client timeout may not be configured",
-                    elapsed.as_secs()
-                );
-            }
-        }
     }
 
     // ── download_version ──────────────────────────────────────────────────────
